@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -221,7 +221,13 @@ fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
     }
 
     let password = if args.password_prompt {
-        let value = rpassword::prompt_password("Entry password: ")?;
+        let value = if io::stdin().is_terminal() {
+            rpassword::prompt_password("Entry password: ")?
+        } else {
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            line.trim_end().to_string()
+        };
         if value.is_empty() { None } else { Some(value) }
     } else if args.generate {
         Some(generate_password(password_options_from_args(
@@ -262,7 +268,13 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
     }
 
     let password = if args.password_prompt {
-        let value = rpassword::prompt_password("Entry password: ")?;
+        let value = if io::stdin().is_terminal() {
+            rpassword::prompt_password("Entry password: ")?
+        } else {
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            line.trim_end().to_string()
+        };
         if value.is_empty() { None } else { Some(value) }
     } else if args.generate {
         Some(generate_password(password_options_from_args(
