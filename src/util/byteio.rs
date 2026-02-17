@@ -1,0 +1,89 @@
+use std::io::{Read, Write};
+
+use crate::error::{AppError, AppResult};
+
+/// Read a u16 in little-endian order.
+pub fn read_u16_le<R: Read>(reader: &mut R) -> AppResult<u16> {
+    let mut buf = [0u8; 2];
+    reader.read_exact(&mut buf)?;
+    Ok(u16::from_le_bytes(buf))
+}
+
+/// Read a u32 in little-endian order.
+pub fn read_u32_le<R: Read>(reader: &mut R) -> AppResult<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+/// Read a u64 in little-endian order.
+pub fn read_u64_le<R: Read>(reader: &mut R) -> AppResult<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Write a u16 in little-endian order.
+pub fn write_u16_le<W: Write>(writer: &mut W, value: u16) -> AppResult<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+/// Write a u32 in little-endian order.
+pub fn write_u32_le<W: Write>(writer: &mut W, value: u32) -> AppResult<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+/// Write a u64 in little-endian order.
+pub fn write_u64_le<W: Write>(writer: &mut W, value: u64) -> AppResult<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+/// Read an exact number of bytes into a vector.
+pub fn read_vec<R: Read>(reader: &mut R, len: usize) -> AppResult<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Read an exact number of bytes into an array.
+pub fn read_array<const N: usize, R: Read>(reader: &mut R) -> AppResult<[u8; N]> {
+    let mut buf = [0u8; N];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Convert a slice to a fixed-size array.
+pub fn to_array<const N: usize>(data: &[u8]) -> AppResult<[u8; N]> {
+    if data.len() != N {
+        return Err(AppError::Format(format!(
+            "expected {N} bytes, got {}",
+            data.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(data);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_write_u32() {
+        let mut buf = Vec::new();
+        write_u32_le(&mut buf, 0xAABBCCDD).expect("write");
+        let mut cursor = std::io::Cursor::new(buf);
+        let value = read_u32_le(&mut cursor).expect("read");
+        assert_eq!(value, 0xAABBCCDD);
+    }
+
+    #[test]
+    fn to_array_ok() {
+        let arr = to_array::<4>(&[1, 2, 3, 4]).expect("array");
+        assert_eq!(arr, [1, 2, 3, 4]);
+    }
+}

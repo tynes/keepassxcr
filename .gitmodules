@@ -1,0 +1,3 @@
+[submodule "keepassxc"]
+	path = keepassxc
+	url = git@github.com:tynes/keepassxc.git
