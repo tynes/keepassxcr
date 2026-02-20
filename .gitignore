@@ -1,2 +1,3 @@
 /target
 *.kdbx
+__pycache__/
