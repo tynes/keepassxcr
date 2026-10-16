@@ -26,6 +26,10 @@ pub enum AppError {
     /// Clipboard interaction failures.
     #[error("clipboard error: {0}")]
     Clipboard(String),
+
+    /// The database's agent unlock expired; the command refuses to prompt.
+    #[error("{0}")]
+    Locked(String),
 }
 
 /// Result alias for keepassxcr operations.

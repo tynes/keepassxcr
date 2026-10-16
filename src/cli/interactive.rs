@@ -8,7 +8,7 @@ use crate::model::Entry;
 
 /// Open a database in interactive REPL mode.
 pub fn open_interactive(args: DbOpenArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_credentials(&args.database, &args.credentials)?;
     let mut file = read_kdbx(&args.database, &credentials)?;
 
     println!("Opened {}", args.database.display());

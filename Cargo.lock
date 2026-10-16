@@ -726,6 +726,7 @@ dependencies = [
  "hex",
  "hmac",
  "indicatif",
+ "libc",
  "predicates",
  "quick-xml",
  "rand",

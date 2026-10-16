@@ -8,6 +8,7 @@ use rand::rngs::OsRng;
 use secrecy::SecretString;
 use uuid::Uuid;
 
+use crate::agent::AgentKey;
 use crate::crypto::{
     CipherId, CompositeKey, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo, decrypt, encrypt,
     hmac_sha256, kdbx_hmac_key,
@@ -34,6 +35,8 @@ pub struct Credentials {
     pub password: Option<SecretString>,
     /// Optional key file.
     pub key_file: Option<KeyFile>,
+    /// Unlocked agent holding the composite key, used instead of the fields above.
+    pub agent: Option<AgentKey>,
 }
 
 impl Credentials {
@@ -51,7 +54,19 @@ impl Credentials {
 
     /// True if no credential components were provided.
     pub fn is_empty(&self) -> bool {
-        self.password.is_none() && self.key_file.is_none()
+        self.password.is_none() && self.key_file.is_none() && self.agent.is_none()
+    }
+
+    /// Run the KDF over the composite key, locally or in the unlocked agent.
+    pub fn transform_key(&self, kdf: &KdfConfig) -> AppResult<Vec<u8>> {
+        if let Some(agent) = &self.agent {
+            return agent.transform(kdf);
+        }
+        let composite = self.composite_key()?;
+        if composite.is_empty() {
+            return Err(AppError::InvalidInput("empty composite key".to_string()));
+        }
+        kdf.transform(&composite.raw_key())
     }
 }
 
@@ -161,13 +176,7 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
         ));
     }
 
-    let composite = credentials.composite_key()?;
-    if composite.is_empty() {
-        return Err(AppError::InvalidInput("empty composite key".to_string()));
-    }
-
-    let raw_key = composite.raw_key();
-    let transformed = header.kdf.transform(&raw_key)?;
+    let transformed = credentials.transform_key(&header.kdf)?;
     let final_key = build_final_key(&header.master_seed, &transformed, credentials)?;
 
     let payload = if version.is_kdbx4() {
@@ -206,16 +215,10 @@ fn write_kdbx_bytes(file: &KdbxFile, credentials: &Credentials) -> AppResult<Vec
         ));
     }
 
-    let composite = credentials.composite_key()?;
-    if composite.is_empty() {
-        return Err(AppError::InvalidInput("empty composite key".to_string()));
-    }
-
     let mut kdf = file.kdf.clone();
     randomize_kdf_seed(&mut kdf);
 
-    let raw_key = composite.raw_key();
-    let transformed = kdf.transform(&raw_key)?;
+    let transformed = credentials.transform_key(&kdf)?;
     let mut master_seed = vec![0u8; 32];
     OsRng.fill_bytes(&mut master_seed);
 
@@ -863,6 +866,7 @@ mod tests {
         let credentials = Credentials {
             password: Some(SecretString::new("pw".to_string())),
             key_file: None,
+            agent: None,
         };
         (file, credentials)
     }

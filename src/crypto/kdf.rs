@@ -1,5 +1,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::crypto::constants::{KDF_AES_KDBX3, KDF_AES_KDBX4, KDF_ARGON2D, KDF_ARGON2ID};
@@ -7,7 +8,7 @@ use crate::crypto::hash::sha256;
 use crate::error::{AppError, AppResult};
 
 /// Supported KDF types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KdfType {
     /// AES-KDF for KDBX3 compatibility.
     AesKdbx3,
@@ -47,7 +48,7 @@ impl KdfType {
 }
 
 /// Key derivation configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KdfConfig {
     /// AES-KDF configuration.
     Aes {

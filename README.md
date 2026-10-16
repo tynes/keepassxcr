@@ -77,6 +77,29 @@ keepassxcr diceware --words 8
 keepassxcr open passwords.kdbx
 ```
 
+### Unlock once, use many times
+
+```sh
+keepassxcr unlock passwords.kdbx            # asks for the password once
+keepassxcr show passwords.kdbx Email/Gmail  # no prompt while unlocked
+keepassxcr status                           # exit 0 if anything is unlocked
+keepassxcr lock                             # lock every database now
+```
+
+`unlock` starts a background agent for that database. It holds the composite key (before the
+KDF) and runs the KDF for other keepassxcr commands over a Unix socket in `$XDG_RUNTIME_DIR`
+(or the temp directory) that only your user can reach; the password never leaves it. It locks
+after 15 minutes without use or 8 hours in total, adjustable with `--idle` and `--max`
+(`90s`, `15m`, `8h`, `1d`). Any program running as your user can use it while unlocked, as with
+ssh-agent.
+
+The agent never writes to your terminal. When it times out, commands for that database fail
+with exit code 3 and say to run `unlock` again, instead of stopping a script at a password
+prompt. `keepassxcr status [DB]` prints the time left and exits 0 when unlocked and 1
+otherwise, so it fits in a shell prompt or at the top of a script. After an explicit `lock`,
+commands prompt as usual again. `--password`, `--no-password` or `--no-agent` skip the agent
+for one command; `db-edit` always does, and locks the agent once the credentials change.
+
 ## Command reference
 
 | Category | Command | Description |
@@ -105,6 +128,9 @@ keepassxcr open passwords.kdbx
 | | `diceware` | Generate a diceware passphrase |
 | | `estimate` | Estimate password strength |
 | | `analyze` | Analyze passwords with offline HIBP data |
+| **Unlock agent** | `unlock` | Keep a database unlocked in a background agent |
+| | `lock` | Stop the agent for a database, or all of them |
+| | `status` | Show whether a database is unlocked and for how long |
 
 ## Supported cryptography
 
@@ -125,6 +151,11 @@ src/
 ├── main.rs              Entry point
 ├── lib.rs               Public crate root
 ├── error.rs             Error types (AppError, AppResult)
+├── agent/
+│   ├── mod.rs           Unlock agent types and duration parsing
+│   ├── client.rs        Start, query and stop agents
+│   ├── server.rs        The agent process
+│   └── wire.rs          Socket locations and JSON protocol
 ├── cli/
 │   ├── mod.rs           CLI definition (clap derive)
 │   ├── commands.rs      Subcommand dispatch and handlers
