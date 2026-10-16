@@ -204,7 +204,7 @@ uv sync
 uv run pytest
 ```
 
-Both `keepassxcr` and `keepassxc-cli` must be on `PATH`. Build keepassxcr first with `cargo build`, then either install `keepassxc-cli` from your package manager or build it from the submodule.
+The suite builds keepassxcr itself. It uses an installed `keepassxc-cli` from `$KEEPASSXC_CLI`, `PATH`, or `/Applications/KeePassXC.app` (`brew install --cask keepassxc` on macOS, `apt install keepassxc` on Debian/Ubuntu). Only when none is found does it build `keepassxc-cli` from the submodule, which needs cmake, Qt, Botan and KeePassXC's other build dependencies.
 
 ## KeePassXC submodule
 
