@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
@@ -82,6 +83,15 @@ pub enum Command {
     Generate(GenerateArgs),
     /// Generate a diceware passphrase.
     Diceware(DicewareArgs),
+    /// Keep a database unlocked in a background agent.
+    Unlock(UnlockArgs),
+    /// Stop the unlock agent for a database, or all of them.
+    Lock(LockArgs),
+    /// Show whether a database is unlocked and for how long.
+    Status(LockArgs),
+    /// Run the unlock agent (started by `unlock`).
+    #[command(name = "__agent", hide = true)]
+    Agent(AgentArgs),
 }
 
 /// Common database credential arguments.
@@ -99,6 +109,9 @@ pub struct CredentialArgs {
     /// YubiKey challenge-response slot (1 or 2).
     #[arg(long, value_name = "SLOT")]
     pub yubikey: Option<u8>,
+    /// Ignore the unlock agent and ask for credentials.
+    #[arg(long)]
+    pub no_agent: bool,
 }
 
 /// Open a database with credentials.
@@ -109,6 +122,44 @@ pub struct DbOpenArgs {
 
     #[command(flatten)]
     pub credentials: CredentialArgs,
+}
+
+/// Unlock arguments.
+#[derive(Debug, Args)]
+pub struct UnlockArgs {
+    /// Path to the database file.
+    pub database: PathBuf,
+
+    /// Lock after this long without use (e.g. 90s, 15m, 1h).
+    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = crate::agent::parse_duration)]
+    pub idle: Duration,
+
+    /// Lock after this long no matter what (e.g. 8h, 1d).
+    #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = crate::agent::parse_duration)]
+    pub max: Duration,
+
+    #[command(flatten)]
+    pub credentials: CredentialArgs,
+}
+
+/// Lock and status arguments.
+#[derive(Debug, Args)]
+pub struct LockArgs {
+    /// Path to the database file. Omit for every unlocked database.
+    pub database: Option<PathBuf>,
+}
+
+/// Hidden agent arguments.
+#[derive(Debug, Args)]
+pub struct AgentArgs {
+    /// Canonical database path.
+    pub database: PathBuf,
+    /// Idle timeout in seconds.
+    #[arg(long)]
+    pub idle_secs: u64,
+    /// Maximum lifetime in seconds.
+    #[arg(long)]
+    pub max_secs: u64,
 }
 
 /// Create database arguments.

@@ -11,12 +11,15 @@ use rand::seq::SliceRandom;
 use secrecy::{ExposeSecret, SecretString};
 use sha1::Digest as _;
 use tracing::{error, warn};
+use zeroize::Zeroizing;
 
+use crate::agent::{self, DbState, format_duration};
 use crate::cli::{
     AnalyzeArgs, AttachmentExportArgs, AttachmentImportArgs, AttachmentRemoveArgs, ClipArgs,
     Command, DbCreateArgs, DbEditArgs, DbExportArgs, DbImportArgs, DbOpenArgs, DicewareArgs,
     EntryAddArgs, EntryEditArgs, EntryMoveArgs, EntryPathArgs, EntryShowArgs, EstimateArgs,
-    GenerateArgs, GroupCreateArgs, GroupPathArgs, MergeArgs, PasswordOptionsArgs, SearchArgs,
+    GenerateArgs, GroupCreateArgs, GroupPathArgs, LockArgs, MergeArgs, PasswordOptionsArgs,
+    SearchArgs, UnlockArgs,
 };
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
@@ -57,6 +60,10 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
         Command::Estimate(args) => estimate(args).context("estimate failed"),
         Command::Generate(args) => generate(args).context("generate failed"),
         Command::Diceware(args) => diceware(args).context("diceware failed"),
+        Command::Unlock(args) => unlock(args).context("unlock failed"),
+        Command::Lock(args) => lock(args).context("lock failed"),
+        Command::Status(args) => status(args).context("status failed"),
+        Command::Agent(args) => serve_agent(args).context("agent failed"),
     }
 }
 
@@ -97,7 +104,8 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 }
 
 fn db_edit(args: DbEditArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    // The new credentials start from the current ones, so they must be known here.
+    let credentials = build_local_credentials(&args.credentials)?;
     let file = read_kdbx(&args.database, &credentials)?;
 
     let new_credentials = build_new_credentials(&args, &credentials)?;
@@ -109,11 +117,15 @@ fn db_edit(args: DbEditArgs) -> anyhow::Result<()> {
 
     write_kdbx(&args.database, &file, &new_credentials)?;
     println!("Database credentials updated.");
+    // A running agent still holds the old key.
+    if !agent::lock(Some(&args.database))?.is_empty() {
+        println!("Locked the unlock agent; run 'keepassxcr unlock' with the new credentials.");
+    }
     Ok(())
 }
 
 fn db_info(args: DbOpenArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_credentials(&args.database, &args.credentials)?;
     let file = read_kdbx(&args.database, &credentials)?;
     let (groups, entries) = count_groups_entries(file.database.root());
 
@@ -129,7 +141,7 @@ fn db_info(args: DbOpenArgs) -> anyhow::Result<()> {
 }
 
 fn merge(args: MergeArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_credentials(&args.database, &args.credentials)?;
     let mut target = read_kdbx(&args.database, &credentials)?;
 
     let source_password = match args.source_password {
@@ -150,6 +162,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
             .as_ref()
             .map(|path| KeyFile::load(path))
             .transpose()?,
+        agent: None,
     };
     let source = read_kdbx(&args.source, &source_credentials)?;
 
@@ -248,7 +261,7 @@ fn merge_entry(target: &mut Entry, source: &Entry) -> bool {
 }
 
 fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_credentials(&args.database, &args.credentials)?;
     let file = read_kdbx(&args.database, &credentials)?;
     let mut database = file.database.clone();
     strip_attachments(database.root_mut());
@@ -665,8 +678,110 @@ fn diceware(args: DicewareArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build credentials from CLI arguments.
-pub(crate) fn build_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
+fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
+    if let DbState::Unlocked(status) = agent::state(&args.database)? {
+        println!("Already unlocked; {}", describe_unlocked(&status));
+        return Ok(());
+    }
+    let credentials = build_local_credentials(&args.credentials)?;
+    if credentials.is_empty() {
+        return Err(anyhow::anyhow!(AppError::InvalidInput(
+            "unlock requires at least one credential".to_string(),
+        )));
+    }
+    // Fail on a wrong password now, not on the first command that uses the agent.
+    read_kdbx(&args.database, &credentials)?;
+    let raw_key = Zeroizing::new(credentials.composite_key()?.raw_key());
+    let status = agent::unlock(&args.database, &raw_key, args.idle, args.max)?;
+    println!("Unlocked {}", describe_unlocked(&status));
+    Ok(())
+}
+
+fn lock(args: LockArgs) -> anyhow::Result<()> {
+    let locked = agent::lock(args.database.as_deref())?;
+    if locked.is_empty() {
+        println!("Nothing was unlocked.");
+    }
+    for database in locked {
+        println!("Locked {}", database.display());
+    }
+    Ok(())
+}
+
+/// Print unlock state. Exits 0 when the database (or any, without one) is
+/// unlocked and 1 otherwise, so scripts and shell prompts can test it.
+fn status(args: LockArgs) -> anyhow::Result<()> {
+    let states = match &args.database {
+        Some(database) => vec![agent::state(database)?],
+        None => agent::status_all()?,
+    };
+    if states.is_empty() {
+        println!("No database is unlocked.");
+    }
+    let mut unlocked = false;
+    for state in &states {
+        match state {
+            DbState::Unlocked(status) => {
+                unlocked = true;
+                println!("unlocked {}", describe_unlocked(status));
+            }
+            DbState::Expired(marker) => println!(
+                "expired  {} ({} ago, {})",
+                marker.database.display(),
+                format_duration(marker.age()),
+                marker.reason
+            ),
+            DbState::Locked => println!(
+                "locked   {}",
+                args.database.as_deref().unwrap_or(Path::new("")).display()
+            ),
+        }
+    }
+    if !unlocked {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn describe_unlocked(status: &agent::AgentStatus) -> String {
+    format!(
+        "{} (locks after {} idle, {} at most)",
+        status.database.display(),
+        format_duration(status.idle_left),
+        format_duration(status.max_left),
+    )
+}
+
+fn serve_agent(args: crate::cli::AgentArgs) -> anyhow::Result<()> {
+    agent::serve(
+        &args.database,
+        Duration::from_secs(args.idle_secs),
+        Duration::from_secs(args.max_secs),
+    )?;
+    Ok(())
+}
+
+/// Build credentials for `database`: from its unlock agent when one is
+/// running and no password option was given, otherwise from the arguments.
+pub(crate) fn build_credentials(
+    database: &Path,
+    args: &crate::cli::CredentialArgs,
+) -> AppResult<Credentials> {
+    let explicit =
+        args.password.is_some() || args.no_password || args.yubikey.is_some() || args.no_agent;
+    if !explicit && let Some(key) = agent::credentials_for(database)? {
+        args.validate()?;
+        return Ok(Credentials {
+            password: None,
+            key_file: None,
+            agent: Some(key),
+        });
+    }
+    build_local_credentials(args)
+}
+
+/// Build credentials from CLI arguments only, ignoring any agent.
+fn build_local_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
     build_credentials_with(args, false)
 }
 
@@ -707,7 +822,11 @@ fn build_credentials_with(
         .map(|path| KeyFile::load(path))
         .transpose()?;
 
-    Ok(Credentials { password, key_file })
+    Ok(Credentials {
+        password,
+        key_file,
+        agent: None,
+    })
 }
 
 /// Read a secret from the terminal without echo, or a line from stdin when
@@ -762,7 +881,11 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
         current.key_file.clone()
     };
 
-    Ok(Credentials { password, key_file })
+    Ok(Credentials {
+        password,
+        key_file,
+        agent: None,
+    })
 }
 
 fn parse_version(value: u32) -> AppResult<KdbxVersion> {
@@ -817,7 +940,7 @@ fn load_database(
     path: &Path,
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<(KdbxFile, Credentials)> {
-    let credentials = build_credentials(args)?;
+    let credentials = build_credentials(path, args)?;
     let file = read_kdbx(path, &credentials)?;
     Ok((file, credentials))
 }
