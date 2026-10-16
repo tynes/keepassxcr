@@ -49,6 +49,7 @@ keepassxcr add passwords.kdbx Email/Gmail \
 ```sh
 keepassxcr show passwords.kdbx Email/Gmail
 keepassxcr show passwords.kdbx Email/Gmail --show-password
+keepassxcr show -a Password passwords.kdbx Email/Gmail   # just the value, for scripts
 ```
 
 ### List entries

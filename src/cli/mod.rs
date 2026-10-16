@@ -343,6 +343,13 @@ pub struct EntryShowArgs {
     /// Show TOTP if available.
     #[arg(long)]
     pub totp: bool,
+    /// Print only these attributes' values, one per line (Title, UserName,
+    /// Password, URL, Notes or a custom attribute). Repeatable.
+    #[arg(short = 'a', long = "attributes", value_name = "ATTR")]
+    pub attributes: Vec<String>,
+    /// Accepted for keepassxc-cli compatibility; keepassxcr prints no extra output.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 
     #[command(flatten)]
     pub credentials: CredentialArgs,
