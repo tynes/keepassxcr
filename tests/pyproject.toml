@@ -6,3 +6,10 @@ dependencies = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
+# Stream each command and its exit code while the suite runs; add
+# --log-cli-level=DEBUG to also see stdout/stderr. Failed tests always
+# include the full captured log, output included.
+log_cli = true
+log_cli_level = "INFO"
+log_level = "DEBUG"
+log_cli_format = "%(message)s"
