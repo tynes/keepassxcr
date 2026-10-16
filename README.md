@@ -187,6 +187,8 @@ src/
 
 ## Testing
 
+With [just](https://github.com/casey/just) installed, `just build` builds, `just test` runs the Rust tests, `just compat` runs the compatibility suite, and `just test-all` runs both. Run `just` to list every recipe.
+
 ### Rust unit tests
 
 ```sh
