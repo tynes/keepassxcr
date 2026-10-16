@@ -398,6 +398,22 @@ fn show_entry(args: EntryShowArgs) -> anyhow::Result<()> {
         .entry_by_path(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
+    if !args.attributes.is_empty() {
+        let values = args
+            .attributes
+            .iter()
+            .map(|name| {
+                entry_attribute(entry, name).ok_or_else(|| {
+                    AppError::InvalidInput(format!("{} has no attribute {name}", args.entry))
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        for value in values {
+            println!("{value}");
+        }
+        return Ok(());
+    }
+
     println!("Title: {}", entry.title());
     println!("Username: {}", entry.username());
     if args.show_password {
@@ -569,18 +585,8 @@ fn clip(args: ClipArgs) -> anyhow::Result<()> {
         .entry_by_path(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
-    let value = match args.field.as_str() {
-        "title" => entry.title().to_string(),
-        "username" => entry.username().to_string(),
-        "password" => entry.password().expose_secret().to_string(),
-        "url" => entry.url().to_string(),
-        "notes" => entry.notes().to_string(),
-        _ => {
-            return Err(anyhow::anyhow!(AppError::InvalidInput(
-                "unknown field".to_string(),
-            )));
-        }
-    };
+    let value = entry_attribute(entry, &args.field)
+        .ok_or_else(|| AppError::InvalidInput("unknown field".to_string()))?;
 
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
@@ -945,6 +951,31 @@ fn load_database(
     Ok((file, credentials))
 }
 
+/// Value of a standard attribute (case-insensitive, like keepassxc-cli) or a
+/// custom one (exact name first, then case-insensitive).
+fn entry_attribute(entry: &Entry, name: &str) -> Option<String> {
+    let value = match name.to_ascii_lowercase().as_str() {
+        "title" => entry.title(),
+        "username" => entry.username(),
+        "password" => entry.password().expose_secret(),
+        "url" => entry.url(),
+        "notes" => entry.notes(),
+        _ => {
+            let custom = entry.custom_fields();
+            return custom
+                .get(name)
+                .or_else(|| {
+                    custom
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value)
+                })
+                .cloned();
+        }
+    };
+    Some(value.to_string())
+}
+
 /// Split an entry path into group segments and entry title.
 pub(crate) fn split_entry_path(path: &str) -> AppResult<(Vec<&str>, &str)> {
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -1208,6 +1239,31 @@ fn diceware_words() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_attribute_matches_standard_and_custom_names() {
+        let mut entry = Entry::new("Api".to_string());
+        entry.set_username("alice".to_string());
+        entry.set_password(SecretString::new("pw\nsecond line".to_string()));
+        entry.set_custom_field("RPC_URL".to_string(), "http://x".to_string(), false);
+        assert_eq!(
+            entry_attribute(&entry, "UserName").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            entry_attribute(&entry, "password").as_deref(),
+            Some("pw\nsecond line")
+        );
+        assert_eq!(
+            entry_attribute(&entry, "RPC_URL").as_deref(),
+            Some("http://x")
+        );
+        assert_eq!(
+            entry_attribute(&entry, "rpc_url").as_deref(),
+            Some("http://x")
+        );
+        assert_eq!(entry_attribute(&entry, "missing"), None);
+    }
 
     #[test]
     fn split_entry_path_ok() {
