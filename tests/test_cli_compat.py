@@ -195,18 +195,59 @@ def rust_binary():
     return binary
 
 
-@pytest.fixture(scope="session")
-def original_binary():
-    """Build keepassxc-cli from git submodule once per session."""
-    subprocess.run(
-        ["git", "submodule", "update", "--init", "--recursive"],
-        cwd=PROJECT_ROOT,
-        check=True,
-        timeout=120,
+MACOS_APP_CLI = Path("/Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli")
+
+INSTALL_HINT = (
+    "Install keepassxc-cli and re-run: `brew install --cask keepassxc` on macOS, "
+    "`apt install keepassxc` (or your distro's package) on Linux. "
+    "Or point KEEPASSXC_CLI at an existing binary."
+)
+
+
+def find_installed_keepassxc_cli() -> Path | None:
+    """Return an installed keepassxc-cli, preferring $KEEPASSXC_CLI, then PATH, then the macOS app bundle."""
+    override = os.environ.get("KEEPASSXC_CLI")
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            pytest.exit(f"KEEPASSXC_CLI={override} does not exist", returncode=1)
+        return path
+    on_path = shutil.which("keepassxc-cli")
+    if on_path:
+        return Path(on_path)
+    if MACOS_APP_CLI.is_file():
+        return MACOS_APP_CLI
+    return None
+
+
+def run_build_step(args: list[str], cwd: Path, timeout: int) -> None:
+    """Run one step of the keepassxc-cli build, stopping the session with its output if it fails."""
+    proc = subprocess.run(
+        args, cwd=cwd, capture_output=True, text=True, timeout=timeout
+    )
+    if proc.returncode != 0:
+        output = (proc.stdout + proc.stderr).strip().splitlines()
+        tail = "\n".join(output[-30:])
+        pytest.exit(
+            f"No installed keepassxc-cli found, and building it from the submodule failed.\n"
+            f"`{' '.join(args)}` exited {proc.returncode}:\n{tail}\n\n{INSTALL_HINT}",
+            returncode=1,
+        )
+
+
+def build_keepassxc_cli() -> Path:
+    """Build keepassxc-cli from the git submodule (needs cmake, Qt and KeePassXC's build deps)."""
+    if shutil.which("cmake") is None:
+        pytest.exit(
+            f"No installed keepassxc-cli found, and cmake is not available to build it.\n{INSTALL_HINT}",
+            returncode=1,
+        )
+    run_build_step(
+        ["git", "submodule", "update", "--init", "--recursive"], PROJECT_ROOT, 120
     )
     build_dir = PROJECT_ROOT / "keepassxc" / "build"
     build_dir.mkdir(exist_ok=True)
-    subprocess.run(
+    run_build_step(
         [
             "cmake",
             "..",
@@ -219,35 +260,23 @@ def original_binary():
             "-DWITH_GUI_TESTS=OFF",
             "-DWITH_TESTS=OFF",
         ],
-        cwd=build_dir,
-        check=True,
-        timeout=120,
+        build_dir,
+        120,
     )
-    subprocess.run(
-        ["cmake", "--build", ".", "--target", "keepassxc-cli", "-j"],
-        cwd=build_dir,
-        check=True,
-        timeout=600,
+    run_build_step(
+        ["cmake", "--build", ".", "--target", "keepassxc-cli", "-j"], build_dir, 600
     )
-    # Search for the binary in common build locations
-    candidates = [
-        build_dir / "src" / "cli" / "keepassxc-cli",
-        build_dir / "src" / "keepassxc-cli",
-        build_dir / "keepassxc-cli",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
+    found = sorted(build_dir.rglob("keepassxc-cli"))
+    for candidate in found:
+        if candidate.is_file():
             return candidate
-    # Fallback: find it
-    result = subprocess.run(
-        ["find", str(build_dir), "-name", "keepassxc-cli", "-type", "f"],
-        capture_output=True,
-        text=True,
-    )
-    paths = result.stdout.strip().splitlines()
-    if paths:
-        return Path(paths[0])
-    pytest.fail(f"keepassxc-cli binary not found in {build_dir}")
+    pytest.exit(f"keepassxc-cli binary not found in {build_dir}", returncode=1)
+
+
+@pytest.fixture(scope="session")
+def original_binary():
+    """Use an installed keepassxc-cli, falling back to building it from the submodule."""
+    return find_installed_keepassxc_cli() or build_keepassxc_cli()
 
 
 @pytest.fixture(scope="session")
