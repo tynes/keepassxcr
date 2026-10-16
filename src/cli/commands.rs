@@ -6,12 +6,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use base64::Engine as _;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use secrecy::{ExposeSecret, SecretString};
 use sha1::Digest as _;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::cli::{
     AnalyzeArgs, AttachmentExportArgs, AttachmentImportArgs, AttachmentRemoveArgs, ClipArgs,
@@ -23,7 +22,7 @@ use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
 use crate::format::{Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, write_kdbx};
 use crate::model::{Attachment, Database, Entry, Group};
-use crate::xml::write_database;
+use crate::xml::{BinaryPool, write_database};
 
 /// Dispatch CLI commands.
 pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
@@ -62,7 +61,7 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
 }
 
 fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "db-create requires at least one credential".to_string(),
@@ -133,29 +132,119 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
     let credentials = build_credentials(&args.credentials)?;
     let mut target = read_kdbx(&args.database, &credentials)?;
 
+    let source_password = match args.source_password {
+        Some(password) => {
+            warn_password_argument();
+            Some(SecretString::new(password))
+        }
+        None if args.source_key_file.is_none() => {
+            let password = read_secret("Password for source database: ")?;
+            (!password.is_empty()).then(|| SecretString::new(password))
+        }
+        None => None,
+    };
     let source_credentials = Credentials {
-        password: args.source_password.map(SecretString::new),
+        password: source_password,
         key_file: args
             .source_key_file
             .as_ref()
             .map(|path| KeyFile::load(path))
             .transpose()?,
-        challenge_response: None,
     };
     let source = read_kdbx(&args.source, &source_credentials)?;
 
-    let mut merged_group = source.database.root().clone();
-    let new_name = format!("Merged - {}", merged_group.name());
-    merged_group.set_name(new_name);
-    target.database.root_mut().groups_mut().push(merged_group);
-
+    let stats = merge_databases(&mut target.database, &source.database);
     write_kdbx(&args.database, &target, &credentials)?;
     println!(
-        "Merged {} into {}",
+        "Merged {} into {}: {} added, {} updated.",
         args.source.display(),
-        args.database.display()
+        args.database.display(),
+        stats.added,
+        stats.updated
     );
     Ok(())
+}
+
+/// Counts reported by [`merge_databases`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MergeStats {
+    added: usize,
+    updated: usize,
+}
+
+/// Merge `source` into `target` by UUID, keeping the newer version of each entry.
+///
+/// This follows KeePassXC's default "keep newer" mode: entries and groups are
+/// matched by UUID wherever they are in the tree, new ones are added under
+/// their (matched or newly created) parent group, and when both sides have an
+/// entry the one with the later modification time wins. The losing version is
+/// kept in the entry history, so nothing is lost. The source root group maps
+/// onto the target root group. Deletions recorded in the source are not
+/// applied.
+fn merge_databases(target: &mut Database, source: &Database) -> MergeStats {
+    let mut stats = MergeStats::default();
+    let root_uuid = target.root().uuid();
+    merge_group_contents(target.root_mut(), source.root(), root_uuid, &mut stats);
+    stats
+}
+
+fn merge_group_contents(
+    target_root: &mut Group,
+    source: &Group,
+    target_group: uuid::Uuid,
+    stats: &mut MergeStats,
+) {
+    for entry in source.entries() {
+        if let Some(existing) = target_root.entry_by_uuid_mut(entry.uuid()) {
+            if merge_entry(existing, entry) {
+                stats.updated += 1;
+            }
+        } else if let Some(group) = target_root.group_by_uuid_mut(target_group) {
+            group.entries_mut().push(entry.clone());
+            stats.added += 1;
+        }
+    }
+    for child in source.groups() {
+        if target_root.group_by_uuid(child.uuid()).is_none()
+            && let Some(parent) = target_root.group_by_uuid_mut(target_group)
+        {
+            parent.groups_mut().push(child.shell());
+        }
+        merge_group_contents(target_root, child, child.uuid(), stats);
+    }
+}
+
+/// Merge one entry; returns true if the target's current version changed.
+fn merge_entry(target: &mut Entry, source: &Entry) -> bool {
+    let target_time = target.last_modification_secs();
+    let source_time = source.last_modification_secs();
+    if source_time == target_time {
+        return false;
+    }
+
+    let mut history: Vec<Entry> = target
+        .history()
+        .iter()
+        .chain(source.history())
+        .cloned()
+        .collect();
+    let source_is_newer = source_time > target_time;
+    let (mut winner, loser) = if source_is_newer {
+        (source.clone(), target.clone())
+    } else {
+        (target.clone(), source.clone())
+    };
+    let mut loser = loser;
+    loser.history_mut().clear();
+    history.push(loser);
+
+    // Oldest first, without duplicate versions.
+    history.sort_by_key(|item| item.last_modification_secs());
+    history.dedup_by_key(|item| item.last_modification_secs());
+    history.retain(|item| item.last_modification_secs() != winner.last_modification_secs());
+    *winner.history_mut() = history;
+    *target = winner;
+    source_is_newer
 }
 
 fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
@@ -163,7 +252,13 @@ fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
     let file = read_kdbx(&args.database, &credentials)?;
     let mut database = file.database.clone();
     strip_attachments(database.root_mut());
-    let output = write_database(&database, &[0u8; 32], ProtectedStreamAlgo::Salsa20, false)?;
+    let output = write_database(
+        &database,
+        &[0u8; 32],
+        ProtectedStreamAlgo::Salsa20,
+        false,
+        BinaryPool::InnerHeader,
+    )?;
     let mut stdout = io::stdout();
     stdout.write_all(&output.xml)?;
     Ok(())
@@ -174,7 +269,7 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
     let database =
         crate::xml::read_database(&xml_bytes, &[], &[0u8; 32], ProtectedStreamAlgo::Salsa20)?;
 
-    let credentials = build_credentials(&args.credentials)?;
+    let credentials = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "import requires credentials for new database".to_string(),
@@ -221,13 +316,7 @@ fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
     }
 
     let password = if args.password_prompt {
-        let value = if io::stdin().is_terminal() {
-            rpassword::prompt_password("Entry password: ")?
-        } else {
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            line.trim_end().to_string()
-        };
+        let value = read_secret("Entry password: ")?;
         if value.is_empty() { None } else { Some(value) }
     } else if args.generate {
         Some(generate_password(password_options_from_args(
@@ -254,6 +343,8 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
         .entry_by_path_mut(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
+    // Keep the previous version in the entry history, like KeePassXC does.
+    entry.begin_update();
     if let Some(value) = args.title {
         entry.set_title(value);
     }
@@ -268,13 +359,7 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
     }
 
     let password = if args.password_prompt {
-        let value = if io::stdin().is_terminal() {
-            rpassword::prompt_password("Entry password: ")?
-        } else {
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            line.trim_end().to_string()
-        };
+        let value = read_secret("Entry password: ")?;
         if value.is_empty() { None } else { Some(value) }
     } else if args.generate {
         Some(generate_password(password_options_from_args(
@@ -405,6 +490,7 @@ fn attachment_import(args: AttachmentImportArgs) -> anyhow::Result<()> {
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
     let data = fs::read(&args.file)?;
+    entry.begin_update();
     entry
         .attachments_mut()
         .push(Attachment::new(args.name, data));
@@ -443,15 +529,19 @@ fn attachment_remove(args: AttachmentRemoveArgs) -> anyhow::Result<()> {
         .entry_by_path_mut(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
-    let before = entry.attachments().len();
-    entry
-        .attachments_mut()
-        .retain(|attachment| attachment.name() != args.name);
-    if entry.attachments().len() == before {
+    if !entry
+        .attachments()
+        .iter()
+        .any(|attachment| attachment.name() == args.name)
+    {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "attachment not found".to_string(),
         )));
     }
+    entry.begin_update();
+    entry
+        .attachments_mut()
+        .retain(|attachment| attachment.name() != args.name);
 
     write_kdbx(&args.database, &file, &credentials)?;
     println!("Attachment removed.");
@@ -577,13 +667,33 @@ fn diceware(args: DicewareArgs) -> anyhow::Result<()> {
 
 /// Build credentials from CLI arguments.
 pub(crate) fn build_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
+    build_credentials_with(args, false)
+}
+
+/// Build credentials for a new database, asking twice for a prompted password.
+fn build_new_database_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
+    build_credentials_with(args, true)
+}
+
+fn build_credentials_with(
+    args: &crate::cli::CredentialArgs,
+    confirm: bool,
+) -> AppResult<Credentials> {
     args.validate()?;
+    reject_yubikey(args.yubikey)?;
     let password = if let Some(pass) = &args.password {
+        warn_password_argument();
         Some(SecretString::new(pass.clone()))
     } else if args.no_password {
         None
     } else {
-        let prompt = rpassword::prompt_password("Password: ")?;
+        let prompt = read_secret("Password: ")?;
+        if confirm && !prompt.is_empty() {
+            let repeat = read_secret("Repeat password: ")?;
+            if repeat != prompt {
+                return Err(AppError::InvalidInput("passwords do not match".to_string()));
+            }
+        }
         if prompt.is_empty() {
             None
         } else {
@@ -597,21 +707,48 @@ pub(crate) fn build_credentials(args: &crate::cli::CredentialArgs) -> AppResult<
         .map(|path| KeyFile::load(path))
         .transpose()?;
 
-    let challenge_response = if args.yubikey.is_some() {
-        Some(read_yubikey_response()?)
-    } else {
-        None
-    };
+    Ok(Credentials { password, key_file })
+}
 
-    Ok(Credentials {
-        password,
-        key_file,
-        challenge_response,
-    })
+/// Read a secret from the terminal without echo, or a line from stdin when
+/// stdin is not a terminal (so passwords can be piped in, like keepassxc-cli).
+fn read_secret(prompt: &str) -> io::Result<String> {
+    if io::stdin().is_terminal() {
+        return rpassword::prompt_password(prompt);
+    }
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Warn that passwords given as arguments are visible to other local users.
+fn warn_password_argument() {
+    if io::stderr().is_terminal() {
+        warn!(
+            "passwords given on the command line are visible in the process list and shell \
+             history; pipe the password on stdin or use the prompt instead"
+        );
+    }
+}
+
+/// YubiKey challenge-response is not implemented compatibly with KeePassXC yet.
+///
+/// The challenge has to be sent to the key on every open and save, so a fixed
+/// response cannot work. Fail clearly instead of writing a database KeePassXC
+/// cannot open.
+fn reject_yubikey(slot: Option<u8>) -> AppResult<()> {
+    if slot.is_some() {
+        return Err(AppError::InvalidInput(
+            "YubiKey challenge-response is not supported yet".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<Credentials> {
+    reject_yubikey(args.new_yubikey)?;
     let password = if let Some(pass) = &args.new_password {
+        warn_password_argument();
         Some(SecretString::new(pass.clone()))
     } else if args.new_no_password {
         None
@@ -625,31 +762,7 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
         current.key_file.clone()
     };
 
-    let challenge_response = if args.new_yubikey.is_some() {
-        Some(read_yubikey_response()?)
-    } else {
-        current.challenge_response.clone()
-    };
-
-    Ok(Credentials {
-        password,
-        key_file,
-        challenge_response,
-    })
-}
-
-fn read_yubikey_response() -> AppResult<Vec<u8>> {
-    let value = std::env::var("KEEPASSXCR_YUBIKEY_RESPONSE")
-        .map_err(|_| AppError::InvalidInput("missing KEEPASSXCR_YUBIKEY_RESPONSE".to_string()))?;
-    if value.chars().all(|c| c.is_ascii_hexdigit()) && value.len() % 2 == 0 {
-        let bytes = hex::decode(value)
-            .map_err(|_| AppError::InvalidInput("invalid YubiKey hex".to_string()))?;
-        return Ok(bytes);
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(value.as_bytes())
-        .map_err(|_| AppError::InvalidInput("invalid YubiKey base64".to_string()))?;
-    Ok(bytes)
+    Ok(Credentials { password, key_file })
 }
 
 fn parse_version(value: u32) -> AppResult<KdbxVersion> {
@@ -988,6 +1101,76 @@ mod tests {
         })
         .expect("password");
         assert_eq!(password.len(), 16);
+    }
+
+    fn entry_at(title: &str, password: &str, time: &str) -> Entry {
+        let mut entry = Entry::new(title.to_string());
+        entry.set_password(SecretString::new(password.to_string()));
+        entry.extra_mut().push(crate::model::RawElement::new(
+            "Times".to_string(),
+            format!("<Times><LastModificationTime>{time}</LastModificationTime></Times>"),
+        ));
+        entry
+    }
+
+    #[test]
+    fn merge_keeps_newer_entry_and_history() {
+        let mut target = Database::new("Target".to_string());
+        let old = entry_at("Bank", "old", "2024-01-01T00:00:00Z");
+        let uuid = old.uuid();
+        target.root_mut().entries_mut().push(old);
+
+        let mut source = Database::new("Source".to_string());
+        let mut newer = entry_at("Bank", "new", "2025-01-01T00:00:00Z");
+        newer.set_uuid(uuid);
+        source.root_mut().entries_mut().push(newer);
+        let mut group = Group::new("Work".to_string());
+        group
+            .entries_mut()
+            .push(entry_at("Mail", "m", "2025-01-01T00:00:00Z"));
+        source.root_mut().groups_mut().push(group);
+
+        let stats = merge_databases(&mut target, &source);
+        assert_eq!(
+            stats,
+            MergeStats {
+                added: 1,
+                updated: 1
+            }
+        );
+        let bank = &target.root().entries()[0];
+        assert_eq!(bank.password().expose_secret(), "new");
+        assert_eq!(bank.history()[0].password().expose_secret(), "old");
+        assert_eq!(target.root().groups()[0].entries()[0].title(), "Mail");
+
+        // Merging the same source again changes nothing.
+        let again = merge_databases(&mut target, &source);
+        assert_eq!(again, MergeStats::default());
+        assert_eq!(target.root().entries().len(), 1);
+        assert_eq!(target.root().groups().len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_target_when_newer() {
+        let mut target = Database::new("Target".to_string());
+        let current = entry_at("Bank", "current", "2025-01-01T00:00:00Z");
+        let uuid = current.uuid();
+        target.root_mut().entries_mut().push(current);
+        let mut source = Database::new("Source".to_string());
+        let mut stale = entry_at("Bank", "stale", "2024-01-01T00:00:00Z");
+        stale.set_uuid(uuid);
+        source.root_mut().entries_mut().push(stale);
+
+        merge_databases(&mut target, &source);
+        let bank = &target.root().entries()[0];
+        assert_eq!(bank.password().expose_secret(), "current");
+        assert_eq!(bank.history()[0].password().expose_secret(), "stale");
+    }
+
+    #[test]
+    fn yubikey_is_rejected() {
+        assert!(reject_yubikey(Some(1)).is_err());
+        assert!(reject_yubikey(None).is_ok());
     }
 
     #[test]

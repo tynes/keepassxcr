@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Cursor, Read};
-use std::path::Path;
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -25,7 +25,7 @@ use crate::format::types::{Compression, KdbxVersion};
 use crate::format::variant_map::{VariantValue, read_variant_map, write_variant_map};
 use crate::model::Database;
 use crate::util::{read_u16_le, read_u32_le, read_u64_le, read_vec, write_u16_le, write_u32_le};
-use crate::xml::{read_database, write_database};
+use crate::xml::{BinaryPool, read_database, write_database};
 
 /// Credentials for database operations.
 #[derive(Debug, Clone)]
@@ -34,8 +34,6 @@ pub struct Credentials {
     pub password: Option<SecretString>,
     /// Optional key file.
     pub key_file: Option<KeyFile>,
-    /// Optional challenge-response bytes.
-    pub challenge_response: Option<Vec<u8>>,
 }
 
 impl Credentials {
@@ -48,15 +46,12 @@ impl Credentials {
         if let Some(key_file) = &self.key_file {
             composite.add_keyfile(key_file);
         }
-        if let Some(response) = &self.challenge_response {
-            composite.add_component(response.clone());
-        }
         Ok(composite)
     }
 
     /// True if no credential components were provided.
     pub fn is_empty(&self) -> bool {
-        self.password.is_none() && self.key_file.is_none() && self.challenge_response.is_none()
+        self.password.is_none() && self.key_file.is_none()
     }
 }
 
@@ -84,10 +79,63 @@ pub fn read_kdbx(path: &Path, credentials: &Credentials) -> AppResult<KdbxFile> 
 }
 
 /// Write a KDBX database to disk.
+///
+/// The file is replaced atomically: the data is written and flushed to a
+/// temporary file in the same directory, which is then renamed over the
+/// database. A crash or full disk mid-save leaves the previous file intact.
 pub fn write_kdbx(path: &Path, file: &KdbxFile, credentials: &Credentials) -> AppResult<()> {
     let data = write_kdbx_bytes(file, credentials)?;
-    fs::write(path, data)?;
-    Ok(())
+    write_atomic(path, &data)
+}
+
+/// Atomically replace `path` with `data`, keeping the existing file's permissions.
+fn write_atomic(path: &Path, data: &[u8]) -> AppResult<()> {
+    // Follow a symlinked database so the link itself is not replaced by a file.
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| AppError::InvalidInput("database path has no file name".to_string()))?;
+    let mut suffix = [0u8; 8];
+    OsRng.fill_bytes(&mut suffix);
+    let temp = dir.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        hex::encode(suffix)
+    ));
+
+    let result = (|| -> AppResult<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // New databases are private to the user by default.
+            options.mode(0o600);
+        }
+        let mut handle = options.open(&temp)?;
+        if let Ok(existing) = fs::metadata(&target) {
+            handle.set_permissions(existing.permissions())?;
+        }
+        handle.write_all(data)?;
+        handle.sync_all()?;
+        drop(handle);
+        fs::rename(&temp, &target)?;
+        #[cfg(unix)]
+        if let Ok(directory) = fs::File::open(&dir) {
+            // Persist the rename itself; failure here does not lose data.
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile> {
@@ -164,7 +212,7 @@ fn write_kdbx_bytes(file: &KdbxFile, credentials: &Credentials) -> AppResult<Vec
     }
 
     let mut kdf = file.kdf.clone();
-    ensure_kdf_seed(&mut kdf)?;
+    randomize_kdf_seed(&mut kdf);
 
     let raw_key = composite.raw_key();
     let transformed = kdf.transform(&raw_key)?;
@@ -541,6 +589,7 @@ fn write_kdbx3(
         &protected_stream_key,
         ProtectedStreamAlgo::Salsa20,
         true,
+        BinaryPool::Meta,
     )?;
     let payload = if file.compression == Compression::Gzip {
         compress_gzip(&xml_output.xml)?
@@ -606,6 +655,7 @@ fn write_kdbx4(
         &protected_stream_key,
         file.protected_stream,
         true,
+        BinaryPool::InnerHeader,
     )?;
     let attachments = xml_output.attachments;
 
@@ -682,22 +732,17 @@ fn write_inner_header_field(
     Ok(())
 }
 
-fn ensure_kdf_seed(kdf: &mut KdfConfig) -> AppResult<()> {
-    match kdf {
-        KdfConfig::Aes { seed, .. } => {
-            if seed.is_empty() {
-                seed.resize(32, 0);
-                OsRng.fill_bytes(seed);
-            }
-        }
-        KdfConfig::Argon2 { salt, .. } => {
-            if salt.is_empty() {
-                salt.resize(32, 0);
-                OsRng.fill_bytes(salt);
-            }
-        }
-    }
-    Ok(())
+/// Give the KDF a fresh random 32-byte seed/salt.
+///
+/// Done on every save, like KeePassXC, so no two databases (or two saves of
+/// one database) share a salt.
+fn randomize_kdf_seed(kdf: &mut KdfConfig) {
+    let seed = match kdf {
+        KdfConfig::Aes { seed, .. } => seed,
+        KdfConfig::Argon2 { salt, .. } => salt,
+    };
+    seed.resize(32, 0);
+    OsRng.fill_bytes(seed);
 }
 
 fn kdf_to_variant_map(kdf: &KdfConfig) -> AppResult<BTreeMap<String, VariantValue>> {
@@ -798,6 +843,54 @@ fn kdf_from_variant_map(map: &BTreeMap<String, VariantValue>) -> AppResult<KdfCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_file() -> (KdbxFile, Credentials) {
+        let file = KdbxFile {
+            version: KdbxVersion::V4,
+            cipher: CipherId::Aes256,
+            compression: Compression::Gzip,
+            kdf: KdfConfig::Argon2 {
+                kind: KdfType::Argon2id,
+                salt: vec![0u8; 32],
+                iterations: 1,
+                memory_kib: 64,
+                parallelism: 1,
+                version: 0x13,
+            },
+            protected_stream: ProtectedStreamAlgo::ChaCha20,
+            database: Database::new("Test".to_string()),
+        };
+        let credentials = Credentials {
+            password: Some(SecretString::new("pw".to_string())),
+            key_file: None,
+        };
+        (file, credentials)
+    }
+
+    #[test]
+    fn every_save_uses_a_fresh_kdf_salt() {
+        let (file, credentials) = test_file();
+        let first = write_kdbx_bytes(&file, &credentials).expect("write");
+        let second = write_kdbx_bytes(&file, &credentials).expect("write");
+        let first = read_kdbx_bytes(&first, &credentials).expect("read");
+        let second = read_kdbx_bytes(&second, &credentials).expect("read");
+        assert_ne!(first.kdf.seed(), &[0u8; 32]);
+        assert_ne!(first.kdf.seed(), second.kdf.seed());
+    }
+
+    #[test]
+    fn atomic_write_replaces_file() {
+        let (file, credentials) = test_file();
+        let dir = std::env::temp_dir().join(format!("keepassxcr-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("db.kdbx");
+        fs::write(&path, b"old").expect("seed file");
+        write_kdbx(&path, &file, &credentials).expect("write");
+        read_kdbx(&path, &credentials).expect("read back");
+        let leftovers = fs::read_dir(&dir).expect("list").count();
+        assert_eq!(leftovers, 1, "temporary file left behind");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn kdf_variant_roundtrip() {
