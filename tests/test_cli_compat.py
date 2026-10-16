@@ -6,6 +6,7 @@ equivalent behavior (exit codes, output structure, cross-compatible databases).
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import logging
 import os
@@ -14,6 +15,7 @@ import shutil
 import string
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -881,6 +883,177 @@ class TestShow:
                 stdin_text=pw_stdin,
             )
             assert r.exit_code != 0
+
+
+# Entries for the `show -a` differential tests: (title, attributes, tags), where
+# attributes are (key, value, protected). Values cover whitespace, case
+# collisions and the placeholders keepassxc-cli resolves.
+ATTRIBUTE_ENTRIES = [
+    (
+        "Api",
+        [
+            ("UserName", "alice", False),
+            ("Password", "s3cret", True),
+            ("URL", "https://api.example.com", False),
+            ("Notes", "first line\nPassword: decoy\n", False),
+            ("api-key", "k-123", True),
+            ("Region", "eu-west", False),
+            ("Empty", "", False),
+            ("Spaced Name", "  padded  ", False),
+        ],
+        "zeta; alpha,beta;alpha & co",
+    ),
+    (
+        "Ambig",
+        [("token", "lower", False), ("TOKEN", "upper", False)],
+        "",
+    ),
+    (
+        "Ref",
+        [
+            ("UserName", "{TITLE}-user", False),
+            ("Password", "p{USERNAME}", True),
+            ("URL", "https://Bob:S%20cret@Example.COM:8443/a%20b/c?q=1&r=%41#frag", False),
+            ("Notes", "{REF:U@T:Api}", False),
+            (
+                "Refs",
+                "{REF:T@U:alice}|{REF:I@T:Api}|{REF:A@O:eu-west}|{REF:N@T:Api}"
+                "|{REF:x@T:Api}|{REF:P@T:Nobody}",
+                False,
+            ),
+            ("Mixed", "a{TITLE}b{title}c{Unknown}d{}e{S:Region}f{S:Notes}g{S:Missing}", False),
+            (
+                "UrlParts",
+                "{URL:SCM}|{URL:HOST}|{URL:PORT}|{URL:PATH}|{URL:QUERY}|{URL:FRAGMENT}"
+                "|{URL:USERINFO}|{URL:USERNAME}|{URL:PASSWORD}|{URL:RMVSCM}",
+                False,
+            ),
+            ("Loop", "{S:Loop}", False),
+            ("Nested", "{{TITLE}}", False),
+            ("Other", "{DT_YEAR}-{DT_UTC_YEAR}|{DB_DIR}|[{TOTP}]", False),
+        ],
+        "",
+    ),
+]
+
+SHOW_ATTRIBUTE_CASES = [
+    ("Api", ["Password"]),
+    ("Api", ["password"]),
+    ("Api", ["PASSWORD"]),
+    ("Api", ["UserName", "Password", "URL", "Title"]),
+    ("Api", ["username", "url", "title"]),
+    ("Api", ["Notes"]),
+    ("Api", ["api-key"]),
+    ("Api", ["API-KEY"]),
+    ("Api", ["Region", "Empty"]),
+    ("Api", ["Spaced Name"]),
+    ("Api", ["spaced name"]),
+    ("Api", ["Password", "Password"]),
+    ("Api", ["Uuid", "Tags"]),
+    ("Api", ["uuid"]),
+    ("Api", ["Nope"]),
+    ("Api", ["Password", "Nope", "UserName", "Nope2"]),
+    ("Ambig", ["token", "TOKEN"]),
+    ("Ambig", ["Token"]),
+    ("Ambig", ["Token", "token"]),
+    ("Ref", ["UserName", "Password", "Notes"]),
+    ("Ref", ["Refs"]),
+    ("Ref", ["Mixed"]),
+    ("Ref", ["UrlParts"]),
+    ("Ref", ["Loop", "Nested"]),
+    ("Ref", ["Other"]),
+    ("NoSuchEntry", ["Password"]),
+]
+
+
+def build_attribute_db(original_binary: Path, tmp_path: Path) -> Path:
+    """Create ATTRIBUTE_ENTRIES in a database written by keepassxc-cli.
+
+    keepassxc-cli has no way to add custom attributes, so this exports an
+    empty database, adds the entries to the XML and imports it again.
+    """
+    seed = tmp_path / "seed.kdbx"
+    assert make_db_create(original_binary, seed, TEST_PASSWORD).exit_code == 0
+    exported = run_cli(
+        original_binary, ["export", "-q", str(seed)], stdin_text=TEST_PASSWORD + "\n"
+    )
+    assert exported.exit_code == 0, exported.stderr
+    tree = ET.ElementTree(ET.fromstring(exported.stdout))
+    group = tree.find("./Root/Group")
+    assert group is not None
+    for number, (title, attributes, tags) in enumerate(ATTRIBUTE_ENTRIES, start=1):
+        entry = ET.SubElement(group, "Entry")
+        ET.SubElement(entry, "UUID").text = base64.b64encode(
+            number.to_bytes(16, "big")
+        ).decode()
+        ET.SubElement(entry, "Tags").text = tags or None
+        for key, value, protected in [("Title", title, False)] + attributes:
+            string_el = ET.SubElement(entry, "String")
+            ET.SubElement(string_el, "Key").text = key
+            value_el = ET.SubElement(string_el, "Value")
+            value_el.text = value or None
+            if protected:
+                value_el.set("ProtectInMemory", "True")
+    xml_path = tmp_path / "attributes.xml"
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    db_path = tmp_path / "attributes.kdbx"
+    imported = make_import(original_binary, xml_path, db_path, TEST_PASSWORD)
+    assert imported.exit_code == 0, imported.stderr
+    return db_path
+
+
+def show_attributes(binary: Path, db_path: Path, entry: str, attributes: list[str]) -> CliResult:
+    """Run `show -q -a ...` with each binary's way of passing the password."""
+    args = ["show", "-q", str(db_path), entry]
+    for attribute in attributes:
+        args += ["-a", attribute]
+    if binary.name == "keepassxcr":
+        return run_cli(binary, args + ["--password", TEST_PASSWORD, "--no-agent"])
+    return run_cli(binary, args, stdin_text=TEST_PASSWORD + "\n")
+
+
+@pytest.fixture(scope="module")
+def attribute_db(original_binary, tmp_path_factory):
+    return build_attribute_db(original_binary, tmp_path_factory.mktemp("attributes"))
+
+
+class TestShowAttributes:
+    """Differential tests: `show -a` must print exactly what keepassxc-cli prints."""
+
+    @pytest.mark.parametrize(
+        "entry,attributes",
+        SHOW_ATTRIBUTE_CASES,
+        ids=[f"{entry}:{','.join(attrs)}" for entry, attrs in SHOW_ATTRIBUTE_CASES],
+    )
+    def test_matches_keepassxc_cli(
+        self, rust_binary, original_binary, attribute_db, entry, attributes
+    ):
+        expected = show_attributes(original_binary, attribute_db, entry, attributes)
+        actual = show_attributes(rust_binary, attribute_db, entry, attributes)
+        assert actual.stdout == expected.stdout
+        assert actual.exit_code == expected.exit_code
+        if expected.exit_code != 0:
+            # keepassxc-cli also logs Qt warnings on success; only errors must match.
+            assert actual.stderr == expected.stderr
+
+    def test_matches_after_keepassxcr_saves(
+        self, rust_binary, original_binary, attribute_db
+    ):
+        """Whitespace and every attribute survive a keepassxcr write."""
+        # Same directory, so {DB_DIR} resolves the same.
+        db_path = attribute_db.with_name("saved.kdbx")
+        shutil.copy(attribute_db, db_path)
+        added = run_cli(
+            rust_binary,
+            ["add", str(db_path), "Extra", "--password", TEST_PASSWORD, "--no-agent", "-g"],
+        )
+        assert added.exit_code == 0, added.stderr
+        for entry, attributes in SHOW_ATTRIBUTE_CASES:
+            if entry == "NoSuchEntry":
+                continue
+            before = show_attributes(original_binary, attribute_db, entry, attributes)
+            after = show_attributes(original_binary, db_path, entry, attributes)
+            assert after.stdout == before.stdout, f"{entry} {attributes}"
 
 
 class TestRm:

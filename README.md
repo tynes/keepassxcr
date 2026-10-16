@@ -52,6 +52,12 @@ keepassxcr show passwords.kdbx Email/Gmail --show-password
 keepassxcr show -a Password passwords.kdbx Email/Gmail   # just the value, for scripts
 ```
 
+`show -a` prints exactly what `keepassxc-cli show -a` prints: names match
+case-insensitively, placeholders such as `{USERNAME}`, `{S:attr}` and
+`{REF:P@T:Other}` are resolved, and unknown or ambiguous names are reported on
+stderr after the other values are printed. `{TOTP}` resolves to nothing, since
+keepassxcr does not generate TOTP codes.
+
 ### List entries
 
 ```sh
