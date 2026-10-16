@@ -7,6 +7,7 @@ equivalent behavior (exit codes, output structure, cross-compatible databases).
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEST_PASSWORD = "test-password-12345"
 TEST_PASSWORD_2 = "another-password-67890"
 TIMEOUT = 60
+OUTPUT_LOG_LIMIT = 2000
+
+log = logging.getLogger("compat")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -35,6 +39,22 @@ class CliResult:
     stderr: str
 
 
+def redact_args(args: list[str]) -> list[str]:
+    """Replace password values so they never land in the log."""
+    redacted = list(args)
+    for i, arg in enumerate(redacted[:-1]):
+        if arg in ("--password", "--source-password"):
+            redacted[i + 1] = "***"
+    return redacted
+
+
+def truncate(text: str) -> str:
+    """Shorten long command output for the log."""
+    if len(text) <= OUTPUT_LOG_LIMIT:
+        return text
+    return f"{text[:OUTPUT_LOG_LIMIT]}... [{len(text) - OUTPUT_LOG_LIMIT} more chars]"
+
+
 def run_cli(
     binary: Path,
     args: list[str],
@@ -43,6 +63,8 @@ def run_cli(
     timeout: int = TIMEOUT,
 ) -> CliResult:
     """Run a CLI binary with the given args and return structured result."""
+    stdin_note = " (with stdin)" if stdin_text else ""
+    log.info("$ %s %s%s", binary.name, " ".join(redact_args(args)), stdin_note)
     proc = subprocess.run(
         [str(binary)] + args,
         input=stdin_text,
@@ -51,6 +73,11 @@ def run_cli(
         timeout=timeout,
         env={**os.environ, **(env or {})},
     )
+    log.info("  -> exit %d", proc.returncode)
+    if proc.stdout:
+        log.debug("  stdout:\n%s", truncate(proc.stdout))
+    if proc.stderr:
+        log.debug("  stderr:\n%s", truncate(proc.stderr))
     return CliResult(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -184,6 +211,7 @@ def compare_generate_structure(
 @pytest.fixture(scope="session")
 def rust_binary():
     """Build the Rust binary once per session."""
+    log.info("Building keepassxcr with cargo build --release")
     subprocess.run(
         ["cargo", "build", "--release"],
         cwd=PROJECT_ROOT,
@@ -192,6 +220,7 @@ def rust_binary():
     )
     binary = PROJECT_ROOT / "target" / "release" / "keepassxcr"
     assert binary.exists(), f"Rust binary not found at {binary}"
+    log.info("Using keepassxcr at %s", binary)
     return binary
 
 
@@ -222,6 +251,7 @@ def find_installed_keepassxc_cli() -> Path | None:
 
 def run_build_step(args: list[str], cwd: Path, timeout: int) -> None:
     """Run one step of the keepassxc-cli build, stopping the session with its output if it fails."""
+    log.info("Build step: %s", " ".join(args))
     proc = subprocess.run(
         args, cwd=cwd, capture_output=True, text=True, timeout=timeout
     )
@@ -276,7 +306,12 @@ def build_keepassxc_cli() -> Path:
 @pytest.fixture(scope="session")
 def original_binary():
     """Use an installed keepassxc-cli, falling back to building it from the submodule."""
-    return find_installed_keepassxc_cli() or build_keepassxc_cli()
+    binary = find_installed_keepassxc_cli()
+    if binary is None:
+        log.info("No installed keepassxc-cli found; building it from the submodule")
+        binary = build_keepassxc_cli()
+    log.info("Using keepassxc-cli at %s", binary)
+    return binary
 
 
 @pytest.fixture(scope="session")
