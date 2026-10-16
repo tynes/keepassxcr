@@ -20,7 +20,12 @@ The binary is at `target/release/keepassxcr`.
 ## Usage
 
 All commands that open a database accept credential flags:
-`--password <PW>`, `--key-file <FILE>`, `--yubikey <SLOT>`, `--no-password`.
+`--password <PW>`, `--key-file <FILE>`, `--no-password`.
+
+Without `--password`, the password is prompted for, or read from stdin when stdin is not a
+terminal (`echo "$PW" | keepassxcr ls db.kdbx`). Prefer that over `--password`, which is visible
+to other users in the process list. `db-create` and `import` ask for the password twice.
+`--yubikey` is accepted for compatibility but not supported yet.
 
 ### Create a database
 
@@ -80,7 +85,7 @@ keepassxcr open passwords.kdbx
 | | `db-edit` | Edit database credentials/settings |
 | | `db-info` | Show database metadata |
 | | `open` | Open database in interactive mode |
-| | `merge` | Merge two databases |
+| | `merge` | Merge two databases by UUID, keeping the newer version of each entry |
 | | `export` | Export database to XML |
 | | `import` | Import XML into a new database |
 | **Entries** | `add` | Add an entry |
@@ -108,7 +113,7 @@ keepassxcr open passwords.kdbx
 | Ciphers | AES-128-CBC, AES-256-CBC, Twofish-CBC, ChaCha20 |
 | KDFs | AES-KDF, Argon2d, Argon2id |
 | Protected streams | Salsa20, ChaCha20 |
-| Credentials | Password, key file, YubiKey challenge-response |
+| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0) |
 | Formats | KDBX 3.1, KDBX 4.0, KDBX 4.1 |
 
 All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`). There are no C bindings.

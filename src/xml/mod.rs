@@ -1,30 +1,49 @@
 //! KeePass XML parser and writer.
+//!
+//! Elements keepassxcr interprets (names, strings, attachments, history) are
+//! parsed into the model. Every other element is kept verbatim as a
+//! [`RawElement`] and written back unchanged, so that saving a database created
+//! by KeePassXC does not drop timestamps, tags, icons, auto-type settings,
+//! custom data, deleted objects or metadata settings.
 
-use std::io::Cursor;
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
 
 use base64::Engine as _;
 use quick_xml::Reader;
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::name::QName;
 use secrecy::ExposeSecret;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::crypto::{ProtectedStream, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
-use crate::model::{Attachment, Database, Entry, Group};
+use crate::model::{Attachment, Database, Entry, Group, RawElement};
+
+/// Where the attachment pool is stored when writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryPool {
+    /// KDBX4: the pool is returned to the caller for the inner header.
+    InnerHeader,
+    /// KDBX3: the pool is written to `Meta/Binaries`.
+    Meta,
+}
 
 /// XML output with attachment pool.
 #[derive(Debug, Clone)]
 pub struct XmlOutput {
     /// Serialized XML bytes.
     pub xml: Vec<u8>,
-    /// Attachment pool in the order written.
+    /// Attachment pool in the order referenced by the XML.
     pub attachments: Vec<Vec<u8>>,
 }
 
 /// Parse a KeePass XML document into a database.
+///
+/// `attachments` is the KDBX4 inner-header attachment pool; for KDBX3 pass an
+/// empty slice and the pool is read from `Meta/Binaries`.
 pub fn read_database(
     xml: &[u8],
     attachments: &[Vec<u8>],
@@ -33,499 +52,696 @@ pub fn read_database(
 ) -> AppResult<Database> {
     let mut reader = Reader::from_reader(xml);
     reader.trim_text(true);
-
-    let mut buf = Vec::new();
-    let mut db_name = "Database".to_string();
-    let mut db_description = String::new();
-    let mut root_group = None;
-    let mut stream = ProtectedStream::new(algo, protected_stream_key)?;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Meta" => {
-                parse_meta(&mut reader, &mut db_name, &mut db_description)?;
-            }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Root" => {
-                root_group = Some(parse_root(&mut reader, &mut stream, attachments)?);
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => {
-                return Err(AppError::Xml(format!("xml parse error: {err}")));
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    let mut database = Database::new(db_name.clone());
-    database.meta_mut().set_name(db_name);
-    database.meta_mut().set_description(db_description);
-    if let Some(group) = root_group {
-        *database.root_mut() = group;
-    }
-
-    Ok(database)
+    let mut parser = Parser {
+        reader,
+        input: xml,
+        stream: ProtectedStream::new(algo, protected_stream_key)?,
+        binaries: attachments.to_vec(),
+    };
+    parser.parse_document()
 }
 
 /// Serialize a database to KeePass XML.
+///
+/// Protected values are encrypted with the inner stream in document order when
+/// `protect_fields` is true (always the case inside a KDBX file).
 pub fn write_database(
     database: &Database,
     protected_stream_key: &[u8],
     algo: ProtectedStreamAlgo,
     protect_fields: bool,
+    pool: BinaryPool,
 ) -> AppResult<XmlOutput> {
     let mut output = Vec::new();
-    let mut writer = Writer::new_with_indent(Cursor::new(&mut output), b' ', 4);
+    let mut writer = Writer::new_with_indent(Cursor::new(&mut output), b'\t', 1);
     let mut stream = ProtectedStream::new(algo, protected_stream_key)?;
-    let mut attachments = Vec::new();
+    let (attachments, index) = build_attachment_pool(database.root());
 
     writer
         .write_event(Event::Decl(quick_xml::events::BytesDecl::new(
             "1.0",
             Some("UTF-8"),
-            None,
+            Some("yes"),
         )))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+        .map_err(xml_write_error)?;
+    start(&mut writer, BytesStart::new("KeePassFile"))?;
 
-    writer
-        .write_event(Event::Start(BytesStart::new("KeePassFile")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+    let meta_pool = if pool == BinaryPool::Meta {
+        attachments.as_slice()
+    } else {
+        &[]
+    };
+    write_meta(&mut writer, database, meta_pool)?;
 
-    write_meta(&mut writer, database)?;
-    write_root(
-        &mut writer,
-        database.root(),
-        &mut stream,
-        &mut attachments,
+    let mut ctx = WriteContext {
+        stream: &mut stream,
+        index: &index,
         protect_fields,
-    )?;
+    };
+    start(&mut writer, BytesStart::new("Root"))?;
+    write_group(&mut writer, database.root(), &mut ctx)?;
+    write_raw(&mut writer, database.root_extra())?;
+    end(&mut writer, "Root")?;
 
-    writer
-        .write_event(Event::End(BytesEnd::new("KeePassFile")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+    end(&mut writer, "KeePassFile")?;
 
+    let attachments = if pool == BinaryPool::InnerHeader {
+        attachments
+    } else {
+        Vec::new()
+    };
     Ok(XmlOutput {
         xml: output,
         attachments,
     })
 }
 
-fn parse_meta(
-    reader: &mut Reader<&[u8]>,
-    name: &mut String,
-    description: &mut String,
-) -> AppResult<()> {
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"DatabaseName" => {
-                *name = read_text(reader)?;
-            }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"DatabaseDescription" => {
-                *description = read_text(reader)?;
-            }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Meta" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml meta error: {err}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(())
+// ─── Reading ────────────────────────────────────────────────────────────────
+
+/// Streaming parser state.
+///
+/// The inner random stream must be applied to protected values in document
+/// order, so a single parser walks the whole document once.
+struct Parser<'a> {
+    reader: Reader<&'a [u8]>,
+    input: &'a [u8],
+    stream: ProtectedStream,
+    binaries: Vec<Vec<u8>>,
 }
 
-fn parse_root(
-    reader: &mut Reader<&[u8]>,
-    stream: &mut ProtectedStream,
-    attachments: &[Vec<u8>],
-) -> AppResult<Group> {
-    let mut buf = Vec::new();
-    let mut root_group = None;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Group" => {
-                root_group = Some(parse_group(reader, stream, attachments)?);
-            }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Root" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml root error: {err}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    root_group.ok_or_else(|| AppError::Xml("missing root group".to_string()))
+/// One child event of an element being parsed.
+enum Child {
+    /// A start tag with its name and attributes (owned so the reader can advance).
+    Start(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, usize),
+    /// A self-closing tag.
+    Empty(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, usize),
+    /// The end tag of the parent element.
+    End,
 }
 
-fn parse_group(
-    reader: &mut Reader<&[u8]>,
-    stream: &mut ProtectedStream,
-    attachments: &[Vec<u8>],
-) -> AppResult<Group> {
-    let mut buf = Vec::new();
-    let mut name = "Group".to_string();
-    let mut uuid = None;
-    let mut entries = Vec::new();
-    let mut groups = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"UUID" => {
-                uuid = Some(parse_uuid(&read_text(reader)?)?);
+impl<'a> Parser<'a> {
+    fn parse_document(&mut self) -> AppResult<Database> {
+        let mut database = Database::new("Database".to_string());
+        let mut root_group = None;
+        loop {
+            match self.reader.read_event() {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"Meta" => {
+                    self.parse_meta(&mut database)?;
+                }
+                Ok(Event::Start(e)) if e.name().as_ref() == b"Root" => {
+                    root_group = Some(self.parse_root(&mut database)?);
+                }
+                Ok(Event::Eof) => break,
+                Err(err) => return Err(AppError::Xml(format!("xml parse error: {err}"))),
+                _ => {}
             }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Name" => {
-                name = read_text(reader)?;
-            }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Entry" => {
-                entries.push(parse_entry(reader, stream, attachments)?);
-            }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Group" => {
-                groups.push(parse_group(reader, stream, attachments)?);
-            }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Group" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml group error: {err}"))),
-            _ => {}
         }
-        buf.clear();
+        if let Some(group) = root_group {
+            *database.root_mut() = group;
+        }
+        Ok(database)
     }
 
-    let mut group = match uuid {
-        Some(value) => Group::with_uuid(value, name),
-        None => Group::new(name),
-    };
-    *group.groups_mut() = groups;
-    *group.entries_mut() = entries;
-    Ok(group)
-}
-
-fn parse_entry(
-    reader: &mut Reader<&[u8]>,
-    stream: &mut ProtectedStream,
-    attachments: &[Vec<u8>],
-) -> AppResult<Entry> {
-    let mut buf = Vec::new();
-    let mut uuid = None;
-    let mut title = "Entry".to_string();
-    let mut username = None;
-    let mut password = None;
-    let mut url = None;
-    let mut notes = None;
-    let mut custom = Vec::new();
-    let mut entry_attachments = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"UUID" => {
-                uuid = Some(parse_uuid(&read_text(reader)?)?);
+    /// Read the next child event of the current element.
+    fn next_child(&mut self) -> AppResult<Child> {
+        loop {
+            let start_pos = self.reader.buffer_position();
+            match self.reader.read_event() {
+                Ok(Event::Start(e)) => {
+                    return Ok(Child::Start(
+                        e.name().as_ref().to_vec(),
+                        attrs(&e),
+                        start_pos,
+                    ));
+                }
+                Ok(Event::Empty(e)) => {
+                    return Ok(Child::Empty(
+                        e.name().as_ref().to_vec(),
+                        attrs(&e),
+                        start_pos,
+                    ));
+                }
+                Ok(Event::End(_)) | Ok(Event::Eof) => return Ok(Child::End),
+                Err(err) => return Err(AppError::Xml(format!("xml parse error: {err}"))),
+                _ => {}
             }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"String" => {
-                let (key, value, protected) = parse_string(reader, stream)?;
-                match key.as_str() {
-                    "Title" => title = value,
-                    "UserName" => username = Some(value),
-                    "Password" => {
-                        password = Some(value);
+        }
+    }
+
+    /// Skip the rest of an element whose start tag was just read and return it verbatim.
+    fn capture(&mut self, name: &[u8], start_pos: usize) -> AppResult<RawElement> {
+        self.reader
+            .read_to_end(QName(name))
+            .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+        self.raw_since(name, start_pos)
+    }
+
+    /// Return the source text from `start_pos` to the reader position as a raw element.
+    fn raw_since(&self, name: &[u8], start_pos: usize) -> AppResult<RawElement> {
+        let end_pos = self.reader.buffer_position();
+        let xml = std::str::from_utf8(&self.input[start_pos..end_pos])
+            .map_err(|_| AppError::Xml("invalid utf8".to_string()))?
+            .trim()
+            .to_string();
+        Ok(RawElement::new(utf8(name)?, xml))
+    }
+
+    /// Read the text content of a leaf element whose start tag was just read.
+    fn read_text(&mut self) -> AppResult<String> {
+        let mut text = String::new();
+        loop {
+            match self.reader.read_event() {
+                Ok(Event::Text(e)) => {
+                    text.push_str(
+                        &e.unescape()
+                            .map_err(|_| AppError::Xml("invalid text".to_string()))?,
+                    );
+                }
+                Ok(Event::CData(e)) => {
+                    text.push_str(&utf8(&e.into_inner())?);
+                }
+                Ok(Event::End(_)) | Ok(Event::Eof) => break,
+                Ok(Event::Start(e)) => {
+                    let name = e.name().as_ref().to_vec();
+                    self.reader
+                        .read_to_end(QName(&name))
+                        .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                }
+                Err(err) => return Err(AppError::Xml(format!("xml text error: {err}"))),
+                _ => {}
+            }
+        }
+        Ok(text)
+    }
+
+    fn parse_meta(&mut self, database: &mut Database) -> AppResult<()> {
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, pos) => match name.as_slice() {
+                    b"DatabaseName" => {
+                        let value = self.read_text()?;
+                        database.meta_mut().set_name(value);
                     }
-                    "URL" => url = Some(value),
-                    "Notes" => notes = Some(value),
-                    _ => custom.push((key, value, protected)),
-                }
+                    b"DatabaseDescription" => {
+                        let value = self.read_text()?;
+                        database.meta_mut().set_description(value);
+                    }
+                    // Regenerated on write.
+                    b"Generator" | b"HeaderHash" => {
+                        self.read_text()?;
+                    }
+                    b"Binaries" => self.parse_meta_binaries()?,
+                    _ => {
+                        let raw = self.capture(&name, pos)?;
+                        database.meta_mut().extra_mut().push(raw);
+                    }
+                },
+                Child::Empty(name, _, pos) => match name.as_slice() {
+                    b"DatabaseName" => database.meta_mut().set_name(String::new()),
+                    b"DatabaseDescription" => database.meta_mut().set_description(String::new()),
+                    b"Generator" | b"HeaderHash" | b"Binaries" => {}
+                    _ => {
+                        let raw = self.raw_since(&name, pos)?;
+                        database.meta_mut().extra_mut().push(raw);
+                    }
+                },
             }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Binary" => {
-                if let Some(attachment) = parse_binary(reader, attachments)? {
-                    entry_attachments.push(attachment);
-                }
-            }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Entry" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml entry error: {err}"))),
-            _ => {}
         }
-        buf.clear();
+        Ok(())
     }
 
-    let mut entry = match uuid {
-        Some(value) => Entry::with_uuid(value, title),
-        None => Entry::new(title),
-    };
-    if let Some(value) = username {
-        entry.set_username(value);
-    }
-    if let Some(value) = password {
-        entry.set_password(secrecy::SecretString::new(value));
-    }
-    if let Some(value) = url {
-        entry.set_url(value);
-    }
-    if let Some(value) = notes {
-        entry.set_notes(value);
-    }
-    for (key, value, protected) in custom {
-        entry.set_custom_field(key, value, protected);
-    }
-    for attachment in entry_attachments {
-        entry.attachments_mut().push(attachment);
-    }
-    Ok(entry)
-}
+    /// Parse the KDBX3 attachment pool in `Meta/Binaries`.
+    fn parse_meta_binaries(&mut self) -> AppResult<()> {
+        loop {
+            let (attributes, data) = match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, attributes, _) if name.as_slice() == b"Binary" => {
+                    (attributes, self.read_text()?)
+                }
+                Child::Empty(name, attributes, _) if name.as_slice() == b"Binary" => {
+                    (attributes, String::new())
+                }
+                Child::Start(name, _, _) => {
+                    self.reader
+                        .read_to_end(QName(&name))
+                        .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                    continue;
+                }
+                Child::Empty(..) => continue,
+            };
 
-fn parse_string(
-    reader: &mut Reader<&[u8]>,
-    stream: &mut ProtectedStream,
-) -> AppResult<(String, String, bool)> {
-    let mut buf = Vec::new();
-    let mut key = String::new();
-    let mut value = String::new();
-    let mut protected = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Key" => {
-                key = read_text(reader)?;
+            let id = attr(&attributes, b"ID")
+                .ok_or_else(|| AppError::Xml("binary without ID".to_string()))?
+                .parse::<usize>()
+                .map_err(|_| AppError::Xml("invalid binary ID".to_string()))?;
+            let mut bytes = decode_base64(&data, "binary")?;
+            if attr(&attributes, b"Protected").as_deref() == Some("True") {
+                self.stream.apply(&mut bytes)?;
             }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Value" => {
-                let is_protected = e.attributes().flatten().any(|attr| {
-                    attr.key.as_ref() == b"Protected" && attr.value.as_ref() == b"True"
-                });
-                let protect_in_memory = e.attributes().flatten().any(|attr| {
-                    attr.key.as_ref() == b"ProtectInMemory" && attr.value.as_ref() == b"True"
-                });
-                protected = is_protected || protect_in_memory;
-                let raw = read_text(reader)?;
-                if is_protected {
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(raw.as_bytes())
-                        .map_err(|_| AppError::Xml("invalid protected base64".to_string()))?;
-                    let mut bytes = decoded.clone();
-                    stream.apply(&mut bytes)?;
-                    value = String::from_utf8(bytes)
-                        .map_err(|_| AppError::Xml("invalid protected utf8".to_string()))?;
-                } else {
-                    value = raw;
+            if attr(&attributes, b"Compressed").as_deref() == Some("True") {
+                let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)?;
+                bytes = out;
+            }
+            if self.binaries.len() <= id {
+                self.binaries.resize(id + 1, Vec::new());
+            }
+            self.binaries[id] = bytes;
+        }
+        Ok(())
+    }
+
+    fn parse_root(&mut self, database: &mut Database) -> AppResult<Group> {
+        let mut root_group = None;
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, _) if name.as_slice() == b"Group" && root_group.is_none() => {
+                    root_group = Some(self.parse_group()?);
+                }
+                Child::Start(name, _, pos) => {
+                    let raw = self.capture(&name, pos)?;
+                    database.root_extra_mut().push(raw);
+                }
+                Child::Empty(name, _, pos) => {
+                    let raw = self.raw_since(&name, pos)?;
+                    database.root_extra_mut().push(raw);
                 }
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"String" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml string error: {err}"))),
-            _ => {}
         }
-        buf.clear();
+        root_group.ok_or_else(|| AppError::Xml("missing root group".to_string()))
     }
 
-    Ok((key, value, protected))
-}
-
-fn parse_binary(
-    reader: &mut Reader<&[u8]>,
-    attachments: &[Vec<u8>],
-) -> AppResult<Option<Attachment>> {
-    let mut buf = Vec::new();
-    let mut key = None;
-    let mut value = None;
-    let mut ref_index = None;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Key" => {
-                key = Some(read_text(reader)?);
+    fn parse_group(&mut self) -> AppResult<Group> {
+        let mut group = Group::new("Group".to_string());
+        let mut uuid = None;
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, pos) => match name.as_slice() {
+                    b"UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    b"Name" => {
+                        let value = self.read_text()?;
+                        group.set_name(value);
+                    }
+                    b"Entry" => {
+                        let entry = self.parse_entry()?;
+                        group.entries_mut().push(entry);
+                    }
+                    b"Group" => {
+                        let child = self.parse_group()?;
+                        group.groups_mut().push(child);
+                    }
+                    _ => {
+                        let raw = self.capture(&name, pos)?;
+                        group.extra_mut().push(raw);
+                    }
+                },
+                Child::Empty(name, _, pos) => match name.as_slice() {
+                    b"Name" => group.set_name(String::new()),
+                    b"UUID" | b"Entry" | b"Group" => {}
+                    _ => {
+                        let raw = self.raw_since(&name, pos)?;
+                        group.extra_mut().push(raw);
+                    }
+                },
             }
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Value" => {
-                for attr in e.attributes().flatten() {
-                    if attr.key.as_ref() == b"Ref" {
-                        let idx = std::str::from_utf8(attr.value.as_ref())
-                            .map_err(|_| AppError::Xml("invalid attachment ref".to_string()))?;
-                        ref_index =
-                            Some(idx.parse::<usize>().map_err(|_| {
-                                AppError::Xml("invalid attachment ref".to_string())
-                            })?);
+        }
+        if let Some(uuid) = uuid {
+            group.set_uuid(uuid);
+        }
+        Ok(group)
+    }
+
+    fn parse_entry(&mut self) -> AppResult<Entry> {
+        let mut uuid = None;
+        let mut entry = Entry::new(String::new());
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, pos) => match name.as_slice() {
+                    b"UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    b"String" => {
+                        let (key, value, protected) = self.parse_string()?;
+                        match key.as_str() {
+                            "Title" => entry.set_title(value),
+                            "UserName" => entry.set_username(value),
+                            "Password" => entry.set_password(secrecy::SecretString::new(value)),
+                            "URL" => entry.set_url(value),
+                            "Notes" => entry.set_notes(value),
+                            _ => entry.set_custom_field(key, value, protected),
+                        }
+                    }
+                    b"Binary" => {
+                        if let Some(attachment) = self.parse_binary()? {
+                            entry.attachments_mut().push(attachment);
+                        }
+                    }
+                    b"History" => self.parse_history(&mut entry)?,
+                    _ => {
+                        let raw = self.capture(&name, pos)?;
+                        entry.extra_mut().push(raw);
+                    }
+                },
+                Child::Empty(name, _, pos) => match name.as_slice() {
+                    b"UUID" | b"String" | b"Binary" | b"History" => {}
+                    _ => {
+                        let raw = self.raw_since(&name, pos)?;
+                        entry.extra_mut().push(raw);
+                    }
+                },
+            }
+        }
+        if let Some(uuid) = uuid {
+            entry.set_uuid(uuid);
+        }
+        Ok(entry)
+    }
+
+    fn parse_history(&mut self, entry: &mut Entry) -> AppResult<()> {
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, _) if name.as_slice() == b"Entry" => {
+                    let item = self.parse_entry()?;
+                    entry.history_mut().push(item);
+                }
+                Child::Start(name, _, _) => {
+                    self.reader
+                        .read_to_end(QName(&name))
+                        .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                }
+                Child::Empty(..) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_string(&mut self) -> AppResult<(String, String, bool)> {
+        let mut key = String::new();
+        let mut value = String::new();
+        let mut protected = false;
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, attributes, _) => match name.as_slice() {
+                    b"Key" => key = self.read_text()?,
+                    b"Value" => {
+                        let is_protected =
+                            attr(&attributes, b"Protected").as_deref() == Some("True");
+                        let in_memory =
+                            attr(&attributes, b"ProtectInMemory").as_deref() == Some("True");
+                        protected = is_protected || in_memory;
+                        let raw = self.read_text()?;
+                        value = if is_protected {
+                            let mut bytes = decode_base64(&raw, "protected value")?;
+                            self.stream.apply(&mut bytes)?;
+                            String::from_utf8(bytes)
+                                .map_err(|_| AppError::Xml("invalid protected utf8".to_string()))?
+                        } else {
+                            raw
+                        };
+                    }
+                    _ => {
+                        self.reader
+                            .read_to_end(QName(&name))
+                            .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                    }
+                },
+                Child::Empty(name, attributes, _) => {
+                    if name.as_slice() == b"Value" {
+                        protected = attr(&attributes, b"Protected").as_deref() == Some("True")
+                            || attr(&attributes, b"ProtectInMemory").as_deref() == Some("True");
+                        value.clear();
                     }
                 }
-                let raw = read_text(reader)?;
-                if !raw.is_empty() {
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(raw.as_bytes())
-                        .map_err(|_| AppError::Xml("invalid attachment base64".to_string()))?;
-                    value = Some(decoded);
-                }
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Binary" => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml binary error: {err}"))),
-            _ => {}
         }
-        buf.clear();
+        Ok((key, value, protected))
     }
 
-    let name = match key {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    let data = if let Some(index) = ref_index {
-        attachments
-            .get(index)
-            .cloned()
-            .ok_or_else(|| AppError::Xml("attachment ref out of bounds".to_string()))?
-    } else {
-        value.ok_or_else(|| AppError::Xml("missing attachment data".to_string()))?
-    };
+    fn parse_binary(&mut self) -> AppResult<Option<Attachment>> {
+        let mut key = None;
+        let mut value = None;
+        let mut ref_index = None;
+        loop {
+            let attributes = match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, attributes, _) => match name.as_slice() {
+                    b"Key" => {
+                        key = Some(self.read_text()?);
+                        continue;
+                    }
+                    b"Value" => {
+                        let raw = self.read_text()?;
+                        if !raw.is_empty() {
+                            let mut bytes = decode_base64(&raw, "attachment")?;
+                            if attr(&attributes, b"Protected").as_deref() == Some("True") {
+                                self.stream.apply(&mut bytes)?;
+                            }
+                            value = Some(bytes);
+                        }
+                        attributes
+                    }
+                    _ => {
+                        self.reader
+                            .read_to_end(QName(&name))
+                            .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                        continue;
+                    }
+                },
+                Child::Empty(name, attributes, _) if name.as_slice() == b"Value" => attributes,
+                Child::Empty(..) => continue,
+            };
+            if let Some(index) = attr(&attributes, b"Ref") {
+                ref_index = Some(
+                    index
+                        .parse::<usize>()
+                        .map_err(|_| AppError::Xml("invalid attachment ref".to_string()))?,
+                );
+            }
+        }
 
-    Ok(Some(Attachment::new(name, data)))
+        let name = match key {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let data = match (ref_index, value) {
+            (Some(index), _) => self
+                .binaries
+                .get(index)
+                .cloned()
+                .ok_or_else(|| AppError::Xml("attachment ref out of bounds".to_string()))?,
+            (None, Some(data)) => data,
+            (None, None) => Vec::new(),
+        };
+        Ok(Some(Attachment::new(name, data)))
+    }
 }
 
-fn read_text(reader: &mut Reader<&[u8]>) -> AppResult<String> {
-    let mut buf = Vec::new();
-    let mut text = String::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Text(e)) => {
-                text = e
-                    .unescape()
-                    .map_err(|_| AppError::Xml("invalid text".to_string()))?
-                    .to_string();
-            }
-            Ok(Event::End(_)) => break,
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(AppError::Xml(format!("xml text error: {err}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(text)
+fn attrs(element: &BytesStart) -> Vec<(Vec<u8>, Vec<u8>)> {
+    element
+        .attributes()
+        .flatten()
+        .map(|attribute| (attribute.key.as_ref().to_vec(), attribute.value.to_vec()))
+        .collect()
+}
+
+fn attr(attributes: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<String> {
+    attributes
+        .iter()
+        .find(|(name, _)| name.as_slice() == key)
+        .and_then(|(_, value)| String::from_utf8(value.clone()).ok())
+}
+
+fn utf8(bytes: &[u8]) -> AppResult<String> {
+    String::from_utf8(bytes.to_vec()).map_err(|_| AppError::Xml("invalid utf8".to_string()))
+}
+
+fn decode_base64(text: &str, what: &str) -> AppResult<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim().as_bytes())
+        .map_err(|_| AppError::Xml(format!("invalid {what} base64")))
 }
 
 fn parse_uuid(text: &str) -> AppResult<Uuid> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(text.as_bytes())
-        .map_err(|_| AppError::Xml("invalid UUID base64".to_string()))?;
+    let decoded = decode_base64(text, "UUID")?;
     Uuid::from_slice(&decoded).map_err(|_| AppError::Xml("invalid UUID bytes".to_string()))
 }
 
-fn write_meta<W: std::io::Write>(writer: &mut Writer<W>, database: &Database) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("Meta")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+// ─── Writing ────────────────────────────────────────────────────────────────
 
-    write_simple_element(writer, "Generator", "keepassxcr")?;
-    write_simple_element(writer, "DatabaseName", database.meta().name())?;
-    write_simple_element(writer, "DatabaseDescription", database.meta().description())?;
+struct WriteContext<'a> {
+    stream: &'a mut ProtectedStream,
+    index: &'a HashMap<Vec<u8>, usize>,
+    protect_fields: bool,
+}
 
+/// Collect every attachment (including those in history) into a deduplicated pool.
+fn build_attachment_pool(root: &Group) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, usize>) {
+    fn visit_entry(entry: &Entry, pool: &mut Vec<Vec<u8>>, index: &mut HashMap<Vec<u8>, usize>) {
+        for attachment in entry.attachments() {
+            if !index.contains_key(attachment.data()) {
+                index.insert(attachment.data().to_vec(), pool.len());
+                pool.push(attachment.data().to_vec());
+            }
+        }
+        for item in entry.history() {
+            visit_entry(item, pool, index);
+        }
+    }
+    fn visit_group(group: &Group, pool: &mut Vec<Vec<u8>>, index: &mut HashMap<Vec<u8>, usize>) {
+        for entry in group.entries() {
+            visit_entry(entry, pool, index);
+        }
+        for child in group.groups() {
+            visit_group(child, pool, index);
+        }
+    }
+    let mut pool = Vec::new();
+    let mut index = HashMap::new();
+    visit_group(root, &mut pool, &mut index);
+    (pool, index)
+}
+
+fn xml_write_error(err: quick_xml::Error) -> AppError {
+    AppError::Xml(format!("xml write error: {err}"))
+}
+
+fn start<W: std::io::Write>(writer: &mut Writer<W>, element: BytesStart) -> AppResult<()> {
     writer
-        .write_event(Event::End(BytesEnd::new("Meta")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+        .write_event(Event::Start(element))
+        .map_err(xml_write_error)?;
     Ok(())
 }
 
-fn write_root<W: std::io::Write>(
-    writer: &mut Writer<W>,
-    group: &Group,
-    stream: &mut ProtectedStream,
-    attachments: &mut Vec<Vec<u8>>,
-    protect_fields: bool,
-) -> AppResult<()> {
+fn end<W: std::io::Write>(writer: &mut Writer<W>, name: &str) -> AppResult<()> {
     writer
-        .write_event(Event::Start(BytesStart::new("Root")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-
-    write_group(writer, group, stream, attachments, protect_fields)?;
-
-    writer
-        .write_event(Event::End(BytesEnd::new("Root")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+        .write_event(Event::End(BytesEnd::new(name)))
+        .map_err(xml_write_error)?;
     Ok(())
+}
+
+/// Write preserved elements back unchanged.
+fn write_raw<W: std::io::Write>(writer: &mut Writer<W>, elements: &[RawElement]) -> AppResult<()> {
+    for element in elements {
+        writer
+            .write_event(Event::Text(BytesText::from_escaped(element.xml())))
+            .map_err(xml_write_error)?;
+    }
+    Ok(())
+}
+
+fn write_meta<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    database: &Database,
+    binaries: &[Vec<u8>],
+) -> AppResult<()> {
+    start(writer, BytesStart::new("Meta"))?;
+    write_simple_element(writer, "Generator", "keepassxcr")?;
+    write_simple_element(writer, "DatabaseName", database.meta().name())?;
+    write_simple_element(writer, "DatabaseDescription", database.meta().description())?;
+    write_raw(writer, database.meta().extra())?;
+
+    if !binaries.is_empty() {
+        start(writer, BytesStart::new("Binaries"))?;
+        for (id, data) in binaries.iter().enumerate() {
+            let mut element = BytesStart::new("Binary");
+            element.push_attribute(("ID", id.to_string().as_str()));
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            write_text_element(writer, "Binary", element, &encoded)?;
+        }
+        end(writer, "Binaries")?;
+    }
+
+    end(writer, "Meta")
 }
 
 fn write_group<W: std::io::Write>(
     writer: &mut Writer<W>,
     group: &Group,
-    stream: &mut ProtectedStream,
-    attachments: &mut Vec<Vec<u8>>,
-    protect_fields: bool,
+    ctx: &mut WriteContext,
 ) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("Group")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-
+    start(writer, BytesStart::new("Group"))?;
     write_uuid(writer, group.uuid())?;
     write_simple_element(writer, "Name", group.name())?;
-    write_times(writer)?;
+    if !group.extra().iter().any(|raw| raw.name() == "Times") {
+        write_times(writer, OffsetDateTime::now_utc())?;
+    }
+    write_raw(writer, group.extra())?;
 
     for entry in group.entries() {
-        write_entry(writer, entry, stream, attachments, protect_fields)?;
+        write_entry(writer, entry, ctx, true)?;
     }
     for child in group.groups() {
-        write_group(writer, child, stream, attachments, protect_fields)?;
+        write_group(writer, child, ctx)?;
     }
-
-    writer
-        .write_event(Event::End(BytesEnd::new("Group")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+    end(writer, "Group")
 }
 
 fn write_entry<W: std::io::Write>(
     writer: &mut Writer<W>,
     entry: &Entry,
-    stream: &mut ProtectedStream,
-    attachments: &mut Vec<Vec<u8>>,
-    protect_fields: bool,
+    ctx: &mut WriteContext,
+    with_history: bool,
 ) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("Entry")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-
+    start(writer, BytesStart::new("Entry"))?;
     write_uuid(writer, entry.uuid())?;
-    write_times(writer)?;
 
-    write_string(
-        writer,
-        "Title",
-        entry.title(),
-        false,
-        stream,
-        protect_fields,
-    )?;
-    write_string(
-        writer,
-        "UserName",
-        entry.username(),
-        false,
-        stream,
-        protect_fields,
-    )?;
+    let has_times = entry.extra().iter().any(|raw| raw.name() == "Times");
+    if !has_times {
+        write_times(
+            writer,
+            entry.modified().unwrap_or_else(OffsetDateTime::now_utc),
+        )?;
+    }
+    for raw in entry.extra() {
+        match (raw.name(), entry.modified()) {
+            ("Times", Some(modified)) => {
+                let updated =
+                    replace_element_text(raw.xml(), "LastModificationTime", &format_time(modified));
+                write_raw(writer, &[RawElement::new("Times".to_string(), updated)])?;
+            }
+            _ => write_raw(writer, std::slice::from_ref(raw))?,
+        }
+    }
+
+    write_string(writer, "Title", entry.title(), false, ctx)?;
+    write_string(writer, "UserName", entry.username(), false, ctx)?;
     write_string(
         writer,
         "Password",
         entry.password().expose_secret(),
         true,
-        stream,
-        protect_fields,
+        ctx,
     )?;
-    write_string(writer, "URL", entry.url(), false, stream, protect_fields)?;
-    write_string(
-        writer,
-        "Notes",
-        entry.notes(),
-        false,
-        stream,
-        protect_fields,
-    )?;
-
+    write_string(writer, "URL", entry.url(), false, ctx)?;
+    write_string(writer, "Notes", entry.notes(), false, ctx)?;
     for (key, value) in entry.custom_fields() {
         let protected = entry.protected_fields().contains(key);
-        write_string(writer, key, value, protected, stream, protect_fields)?;
+        write_string(writer, key, value, protected, ctx)?;
     }
 
     for attachment in entry.attachments() {
-        let index = attachments.len();
-        attachments.push(attachment.data().to_vec());
+        let index = ctx
+            .index
+            .get(attachment.data())
+            .copied()
+            .ok_or_else(|| AppError::Xml("attachment missing from pool".to_string()))?;
         write_attachment_ref(writer, attachment.name(), index)?;
     }
 
-    writer
-        .write_event(Event::End(BytesEnd::new("Entry")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+    if with_history && !entry.history().is_empty() {
+        start(writer, BytesStart::new("History"))?;
+        for item in entry.history() {
+            write_entry(writer, item, ctx, false)?;
+        }
+        end(writer, "History")?;
+    }
+
+    end(writer, "Entry")
 }
 
 fn write_string<W: std::io::Write>(
@@ -533,30 +749,23 @@ fn write_string<W: std::io::Write>(
     key: &str,
     value: &str,
     protect: bool,
-    stream: &mut ProtectedStream,
-    protect_fields: bool,
+    ctx: &mut WriteContext,
 ) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("String")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-
+    start(writer, BytesStart::new("String"))?;
     write_simple_element(writer, "Key", key)?;
 
     let mut value_element = BytesStart::new("Value");
-    let mut content = value.as_bytes().to_vec();
-    if protect && protect_fields {
+    if protect && ctx.protect_fields {
         value_element.push_attribute(("Protected", "True"));
-        stream.apply(&mut content)?;
+        let mut content = value.as_bytes().to_vec();
+        ctx.stream.apply(&mut content)?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(content);
         write_text_element(writer, "Value", value_element, &encoded)?;
     } else {
         write_text_element(writer, "Value", value_element, value)?;
     }
 
-    writer
-        .write_event(Event::End(BytesEnd::new("String")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+    end(writer, "String")
 }
 
 fn write_attachment_ref<W: std::io::Write>(
@@ -564,20 +773,14 @@ fn write_attachment_ref<W: std::io::Write>(
     name: &str,
     index: usize,
 ) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("Binary")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-
+    start(writer, BytesStart::new("Binary"))?;
     write_simple_element(writer, "Key", name)?;
-
     let mut value_element = BytesStart::new("Value");
     value_element.push_attribute(("Ref", index.to_string().as_str()));
-    write_text_element(writer, "Value", value_element, "")?;
-
     writer
-        .write_event(Event::End(BytesEnd::new("Binary")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+        .write_event(Event::Empty(value_element))
+        .map_err(xml_write_error)?;
+    end(writer, "Binary")
 }
 
 fn write_uuid<W: std::io::Write>(writer: &mut Writer<W>, uuid: Uuid) -> AppResult<()> {
@@ -585,16 +788,38 @@ fn write_uuid<W: std::io::Write>(writer: &mut Writer<W>, uuid: Uuid) -> AppResul
     write_simple_element(writer, "UUID", &encoded)
 }
 
-fn write_times<W: std::io::Write>(writer: &mut Writer<W>) -> AppResult<()> {
-    let now = OffsetDateTime::now_utc();
-    let formatted = now
-        .format(&Rfc3339)
-        .map_err(|_| AppError::Xml("time format".to_string()))?;
+/// Format a timestamp the way KeePass XML expects (ISO 8601, UTC, whole seconds).
+fn format_time(time: OffsetDateTime) -> String {
+    let time = time.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
+}
 
-    writer
-        .write_event(Event::Start(BytesStart::new("Times")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+/// Replace the text of `<tag>…</tag>` in a snippet, or insert the element if missing.
+fn replace_element_text(xml: &str, tag: &str, value: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    if let Some(start) = xml.find(&open).map(|pos| pos + open.len())
+        && let Some(len) = xml[start..].find(&close)
+    {
+        return format!("{}{}{}", &xml[..start], value, &xml[start + len..]);
+    }
+    match xml.rfind("</") {
+        Some(pos) => format!("{}{open}{value}{close}{}", &xml[..pos], &xml[pos..]),
+        None => xml.to_string(),
+    }
+}
 
+fn write_times<W: std::io::Write>(writer: &mut Writer<W>, time: OffsetDateTime) -> AppResult<()> {
+    let formatted = format_time(time);
+    start(writer, BytesStart::new("Times"))?;
     for field in [
         "CreationTime",
         "LastModificationTime",
@@ -606,11 +831,7 @@ fn write_times<W: std::io::Write>(writer: &mut Writer<W>) -> AppResult<()> {
     }
     write_simple_element(writer, "Expires", "False")?;
     write_simple_element(writer, "UsageCount", "0")?;
-
-    writer
-        .write_event(Event::End(BytesEnd::new("Times")))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+    end(writer, "Times")
 }
 
 fn write_simple_element<W: std::io::Write>(
@@ -627,23 +848,40 @@ fn write_text_element<W: std::io::Write>(
     element: BytesStart,
     value: &str,
 ) -> AppResult<()> {
-    writer
-        .write_event(Event::Start(element))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    if !value.is_empty() {
+    // An empty value must be a self-closing tag: with indentation, a separate
+    // end tag would put whitespace inside the element and change the value.
+    if value.is_empty() {
         writer
-            .write_event(Event::Text(BytesText::new(value)))
-            .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
+            .write_event(Event::Empty(element))
+            .map_err(xml_write_error)?;
+        return Ok(());
     }
+    start(writer, element)?;
     writer
-        .write_event(Event::End(BytesEnd::new(name)))
-        .map_err(|err| AppError::Xml(format!("xml write error: {err}")))?;
-    Ok(())
+        .write_event(Event::Text(BytesText::new(value)))
+        .map_err(xml_write_error)?;
+    end(writer, name)
 }
 
 #[cfg(test)]
 mod tests {
+    use secrecy::SecretString;
+
     use super::*;
+
+    const KEY: [u8; 32] = [1u8; 32];
+
+    fn roundtrip(db: &Database, pool: BinaryPool) -> Database {
+        let output =
+            write_database(db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool).expect("write");
+        read_database(
+            &output.xml,
+            &output.attachments,
+            &KEY,
+            ProtectedStreamAlgo::Salsa20,
+        )
+        .expect("read")
+    }
 
     #[test]
     fn xml_roundtrip_basic() {
@@ -652,16 +890,115 @@ mod tests {
         db.root_mut()
             .entries_mut()
             .push(Entry::new("Entry".to_string()));
-
-        let output =
-            write_database(&db, &[1u8; 32], ProtectedStreamAlgo::Salsa20, true).expect("write");
-        let parsed = read_database(
-            &output.xml,
-            &output.attachments,
-            &[1u8; 32],
-            ProtectedStreamAlgo::Salsa20,
-        )
-        .expect("read");
+        let parsed = roundtrip(&db, BinaryPool::InnerHeader);
         assert_eq!(parsed.meta().name(), "Test");
+    }
+
+    #[test]
+    fn history_does_not_replace_current_values() {
+        let mut entry = Entry::new("Bank".to_string());
+        entry.set_password(SecretString::new("old".to_string()));
+        entry.begin_update();
+        entry.set_password(SecretString::new("current".to_string()));
+        let mut db = Database::new("Root".to_string());
+        db.root_mut().entries_mut().push(entry);
+
+        let parsed = roundtrip(&db, BinaryPool::InnerHeader);
+        let entries = parsed.root().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].password().expose_secret(), "current");
+        assert_eq!(entries[0].history().len(), 1);
+        assert_eq!(entries[0].history()[0].password().expose_secret(), "old");
+    }
+
+    #[test]
+    fn unknown_elements_are_preserved() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<KeePassFile><Meta><DatabaseName>DB</DatabaseName><RecycleBinEnabled>True</RecycleBinEnabled></Meta>
+<Root><Group><UUID>AAAAAAAAAAAAAAAAAAAAAA==</UUID><Name>Root</Name><Notes>group notes</Notes>
+<Entry><UUID>AQEBAQEBAQEBAQEBAQEBAQ==</UUID><Tags>a;b</Tags><Times><Expires>True</Expires></Times>
+<String><Key>Title</Key><Value>E</Value></String><AutoType><Enabled>True</Enabled></AutoType></Entry>
+</Group><DeletedObjects><DeletedObject><UUID>AgICAgICAgICAgICAgICAg==</UUID></DeletedObject></DeletedObjects></Root></KeePassFile>"#;
+        let db = read_database(xml, &[], &KEY, ProtectedStreamAlgo::Salsa20).expect("read");
+        let output = write_database(
+            &db,
+            &KEY,
+            ProtectedStreamAlgo::Salsa20,
+            true,
+            BinaryPool::InnerHeader,
+        )
+        .expect("write");
+        let text = String::from_utf8(output.xml).expect("utf8");
+        for needle in [
+            "<RecycleBinEnabled>True</RecycleBinEnabled>",
+            "<Notes>group notes</Notes>",
+            "<Tags>a;b</Tags>",
+            "<Expires>True</Expires>",
+            "<AutoType><Enabled>True</Enabled></AutoType>",
+            "<DeletedObjects>",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in {text}");
+        }
+    }
+
+    #[test]
+    fn attachments_roundtrip_in_both_pools() {
+        let mut entry = Entry::new("E".to_string());
+        entry
+            .attachments_mut()
+            .push(Attachment::new("a.txt".to_string(), b"hello".to_vec()));
+        entry.begin_update();
+        let mut db = Database::new("Root".to_string());
+        db.root_mut().entries_mut().push(entry);
+
+        for pool in [BinaryPool::InnerHeader, BinaryPool::Meta] {
+            let output =
+                write_database(&db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool).expect("write");
+            // The attachment is shared with the history item, so it is stored once.
+            if pool == BinaryPool::InnerHeader {
+                assert_eq!(output.attachments.len(), 1);
+            }
+            let parsed = roundtrip(&db, pool);
+            let attachment = &parsed.root().entries()[0].attachments()[0];
+            assert_eq!(attachment.data(), b"hello");
+        }
+    }
+
+    #[test]
+    fn empty_values_stay_empty() {
+        let mut entry = Entry::new("E".to_string());
+        entry.set_custom_field("Empty".to_string(), String::new(), false);
+        let mut db = Database::new("Root".to_string());
+        db.root_mut().entries_mut().push(entry);
+        let output = write_database(
+            &db,
+            &KEY,
+            ProtectedStreamAlgo::Salsa20,
+            true,
+            BinaryPool::Meta,
+        )
+        .expect("write");
+        let text = String::from_utf8(output.xml).expect("utf8");
+        assert!(text.contains("<Value/>"), "{text}");
+        let parsed = roundtrip(&db, BinaryPool::Meta);
+        let entry = &parsed.root().entries()[0];
+        assert_eq!(entry.url(), "");
+        assert_eq!(
+            entry.custom_fields().get("Empty").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn modified_time_updates_preserved_times() {
+        let updated = replace_element_text(
+            "<Times><LastModificationTime>x</LastModificationTime></Times>",
+            "LastModificationTime",
+            "2024-01-01T00:00:00Z",
+        );
+        assert_eq!(
+            updated,
+            "<Times><LastModificationTime>2024-01-01T00:00:00Z</LastModificationTime></Times>"
+        );
     }
 }
