@@ -11,10 +11,11 @@ use std::time::Duration;
 use tracing::warn;
 use zeroize::Zeroizing;
 
-use crate::agent::wire::{self, Location, Request, Response};
+use crate::agent::wire::{self, Location, Request, Response, Startup};
 use crate::agent::{AgentKey, AgentStatus, DbState};
 use crate::crypto::KdfConfig;
 use crate::error::{AppError, AppResult};
+use crate::yubikey::YubiKeySlot;
 
 /// How long a command waits for the agent. Covers a slow KDF on a busy agent.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -35,9 +36,10 @@ pub fn credentials_for(database: &Path) -> AppResult<Option<AgentKey>> {
         Err(_) => return Ok(None),
     };
     match location_state(&location) {
-        DbState::Unlocked(_) => Ok(Some(AgentKey {
+        DbState::Unlocked(status) => Ok(Some(AgentKey {
             socket: location.socket,
             database: location.database,
+            yubikey: status.yubikey,
         })),
         DbState::Expired(marker) => Err(marker.to_error(database)),
         DbState::Locked => Ok(None),
@@ -67,12 +69,14 @@ pub fn status_all() -> AppResult<Vec<DbState>> {
     Ok(states)
 }
 
-/// Start an agent holding `raw_key` for `database`.
+/// Start an agent holding `key` (the joined password and key-file
+/// components) and the YubiKey slot for `database`.
 ///
 /// An agent that is already running is left as it is.
 pub fn unlock(
     database: &Path,
-    raw_key: &[u8],
+    key: &[u8],
+    yubikey: Option<YubiKeySlot>,
     idle: Duration,
     max: Duration,
 ) -> AppResult<AgentStatus> {
@@ -106,7 +110,12 @@ pub fn unlock(
     let mut child = command.spawn()?;
 
     let mut stdin = child.stdin.take().expect("stdin is piped");
-    let mut key_line = Zeroizing::new(hex::encode(raw_key));
+    let startup = Startup {
+        key: Zeroizing::new(hex::encode(key)),
+        yubikey,
+    };
+    let mut key_line = Zeroizing::new(serde_json::to_string(&startup).map_err(io::Error::from)?);
+    drop(Zeroizing::new(startup.key));
     key_line.push('\n');
     stdin.write_all(key_line.as_bytes())?;
     drop(stdin);
@@ -150,8 +159,59 @@ pub fn lock(database: Option<&Path>) -> AppResult<Vec<PathBuf>> {
 }
 
 /// Ask the agent to run `kdf` over its composite key.
-pub(super) fn transform(key: &AgentKey, kdf: &KdfConfig) -> AppResult<Zeroizing<Vec<u8>>> {
-    let response = query(&key.socket, &Request::Transform { kdf: kdf.clone() }).map_err(|err| {
+pub(super) fn transform(
+    key: &AgentKey,
+    kdf: &KdfConfig,
+    challenge_response: Option<&[u8; 32]>,
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    let response = ask(
+        key,
+        &Request::Transform {
+            kdf: kdf.clone(),
+            challenge_response: challenge_response
+                .map(|response| Zeroizing::new(hex::encode(response))),
+        },
+    )?;
+    let transformed = response
+        .transformed
+        .ok_or_else(|| AppError::Crypto("agent sent no key".to_string()))?;
+    hex::decode(transformed.as_bytes())
+        .map(Zeroizing::new)
+        .map_err(|_| AppError::Crypto("agent sent a malformed key".to_string()))
+}
+
+/// The YubiKey result the agent remembers for `challenge`.
+pub(super) fn recall(key: &AgentKey, challenge: &[u8]) -> AppResult<Option<[u8; 32]>> {
+    let response = ask(
+        key,
+        &Request::Recall {
+            challenge: hex::encode(challenge),
+        },
+    )?;
+    let Some(encoded) = response.challenge_response else {
+        return Ok(None);
+    };
+    let mut decoded = [0u8; 32];
+    hex::decode_to_slice(encoded.as_bytes(), &mut decoded)
+        .map_err(|_| AppError::Crypto("agent sent a malformed YubiKey result".to_string()))?;
+    Ok(Some(decoded))
+}
+
+/// Have the agent remember a YubiKey result for `challenge`.
+pub(super) fn remember(key: &AgentKey, challenge: &[u8], response: &[u8; 32]) -> AppResult<()> {
+    ask(
+        key,
+        &Request::Remember {
+            challenge: hex::encode(challenge),
+            challenge_response: Zeroizing::new(hex::encode(response)),
+        },
+    )?;
+    Ok(())
+}
+
+/// Send `request` to the agent behind `key` and check who answered.
+fn ask(key: &AgentKey, request: &Request) -> AppResult<Response> {
+    let response = query(&key.socket, request).map_err(|err| {
         AppError::Locked(format!(
             "locked: the unlock agent for {} stopped ({err}); run 'keepassxcr unlock {}'",
             key.database.display(),
@@ -166,12 +226,7 @@ pub(super) fn transform(key: &AgentKey, kdf: &KdfConfig) -> AppResult<Zeroizing<
             "agent answered for another database".to_string(),
         ));
     }
-    let transformed = response
-        .transformed
-        .ok_or_else(|| AppError::Crypto("agent sent no key".to_string()))?;
-    hex::decode(transformed.as_bytes())
-        .map(Zeroizing::new)
-        .map_err(|_| AppError::Crypto("agent sent a malformed key".to_string()))
+    Ok(response)
 }
 
 fn location_state(location: &Location) -> DbState {
@@ -195,6 +250,7 @@ fn query_status(socket: &Path, database: Option<&Path>) -> Option<AgentStatus> {
         database: answered,
         idle_left: Duration::from_secs(response.idle_left_secs.unwrap_or(0)),
         max_left: Duration::from_secs(response.max_left_secs.unwrap_or(0)),
+        yubikey: response.yubikey,
     })
 }
 

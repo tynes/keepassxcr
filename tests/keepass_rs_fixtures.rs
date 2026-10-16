@@ -21,6 +21,7 @@ fn fixture(name: &str) -> PathBuf {
 fn credentials(password: Option<&str>, key_file: Option<&str>) -> Credentials {
     Credentials {
         password: password.map(|value| SecretString::new(value.to_string())),
+        yubikey: None,
         key_file: key_file.map(|name| KeyFile::load(&fixture(name)).expect("key file")),
         agent: None,
     }

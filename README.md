@@ -20,12 +20,11 @@ The binary is at `target/release/keepassxcr`.
 ## Usage
 
 All commands that open a database accept credential flags:
-`--password <PW>`, `--key-file <FILE>`, `--no-password`.
+`--password <PW>`, `--key-file <FILE>`, `--no-password`, `-y, --yubikey <SLOT[:SERIAL]>`.
 
 Without `--password`, the password is prompted for, or read from stdin when stdin is not a
 terminal (`echo "$PW" | keepassxcr ls db.kdbx`). Prefer that over `--password`, which is visible
 to other users in the process list, so `--help` no longer lists it. `db-create` and `import` ask for the password twice.
-`--yubikey` is accepted for compatibility but not supported yet.
 
 ### Create a database
 
@@ -107,6 +106,58 @@ otherwise, so it fits in a shell prompt or at the top of a script. After an expl
 commands prompt as usual again. `--password`, `--no-password` or `--no-agent` skip the agent
 for one command; `db-edit` always does, and locks the agent once the credentials change.
 
+### YubiKey
+
+keepassxcr supports YubiKey HMAC-SHA1 challenge-response the same way KeePassXC does, so the
+same database opens in KeePassXC with the same key. It talks to the key's OTP interface over USB
+(IOKit on macOS, hidraw on Linux).
+
+```sh
+ykman otp chalresp --touch --generate 2        # only if slot 2 is empty: this overwrites it
+keepassxcr db-create --yubikey 2 passwords.kdbx
+keepassxcr show -y 2 passwords.kdbx Email/Gmail
+keepassxcr show -y 2:7370001 passwords.kdbx Email/Gmail   # pick a key by serial
+keepassxcr db-edit passwords.kdbx --new-yubikey 2         # add a YubiKey to a database
+keepassxcr db-edit -y 2 passwords.kdbx --unset-yubikey    # remove it
+```
+
+The key prints `Please present or touch your YubiKey to continue.` when it waits for a touch.
+Every save draws a new seed and so asks the key again, as in KeePassXC. With `unlock --yubikey 2`
+the agent remembers the key's answer for the file's current seed, so reads need no touch until
+the file is saved; the save itself needs the key.
+
+On macOS, if the key is not found, allow your terminal under System Settings > Privacy &
+Security > Input Monitoring (the OTP interface is a keyboard to macOS). On Linux you need read
+and write access to its hidraw device, which Yubico's udev rule gives.
+
+#### Using a YubiKey on another machine
+
+Forward the challenge, not the USB device. On the machine with the key:
+
+```sh
+keepassxcr yubikey serve     # listens on ~/.keepassxcr-yubikey.sock
+```
+
+Then connect with the socket forwarded (paths must be absolute):
+
+```sh
+ssh -R /home/me/.keepassxcr-yubikey.sock:/Users/me/.keepassxcr-yubikey.sock server
+```
+
+or in `~/.ssh/config`:
+
+```
+Host server
+    RemoteForward /home/me/.keepassxcr-yubikey.sock /Users/me/.keepassxcr-yubikey.sock
+```
+
+On the server keepassxcr uses `~/.keepassxcr-yubikey.sock` when it exists (or the socket named
+in `KEEPASSXCR_YUBIKEY_SOCKET`) instead of USB, and the touch prompt shows on both machines. A
+leftover socket from an earlier connection makes `ssh -R` fail to bind; add
+`StreamLocalBindUnlink yes` to the server's `sshd_config`, or delete the stale socket. While
+connected, anyone with root on the server can send challenges to your key, as with ssh-agent
+forwarding; a slot set up with `--touch` still needs your finger for each one.
+
 ## Command reference
 
 | Category | Command | Description |
@@ -135,6 +186,7 @@ for one command; `db-edit` always does, and locks the agent once the credentials
 | | `diceware` | Generate a diceware passphrase |
 | | `estimate` | Estimate password strength |
 | | `analyze` | Analyze passwords with offline HIBP data |
+| **YubiKey** | `yubikey serve` | Answer YubiKey challenges forwarded from another machine |
 | **Unlock agent** | `unlock` | Keep a database unlocked in a background agent |
 | | `lock` | Stop the agent for a database, or all of them |
 | | `status` | Show whether a database is unlocked and for how long |
@@ -146,10 +198,10 @@ for one command; `db-edit` always does, and locks the agent once the credentials
 | Ciphers | AES-128-CBC, AES-256-CBC, Twofish-CBC, ChaCha20 |
 | KDFs | AES-KDF, Argon2d, Argon2id |
 | Protected streams | Salsa20, ChaCha20 |
-| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0) |
+| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0), YubiKey HMAC-SHA1 challenge-response |
 | Formats | KDBX 3.1, KDBX 4.0, KDBX 4.1 |
 
-All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`). There are no C bindings.
+All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`). There are no C bindings for cryptography; on macOS, USB access to a YubiKey goes through `hidapi`'s IOKit backend.
 
 ## Project structure
 
@@ -187,9 +239,16 @@ src/
 │   └── mod.rs           Database, Group, Entry data model
 ├── xml/
 │   └── mod.rs           KeePass XML serialization/deserialization
+├── yubikey/
+│   ├── mod.rs           Slot parsing, KeePassXC-style padding, picking a backend
+│   ├── otp.rs           YubiKey OTP HID protocol (frames, CRC, touch polling)
+│   ├── hid.rs           USB access through hidapi
+│   ├── forward.rs       `yubikey serve` and forwarded-socket client
+│   └── emulator.rs      Software YubiKey for tests (`software-yubikey` feature)
 └── util/
     ├── mod.rs           Utility module root
-    └── byteio.rs        Binary read/write helpers
+    ├── byteio.rs        Binary read/write helpers
+    └── unix.rs          User ids of processes and socket peers
 ```
 
 ## Testing
@@ -199,8 +258,12 @@ With [just](https://github.com/casey/just) installed, `just build` builds, `just
 ### Rust unit tests
 
 ```sh
-cargo test
+cargo test --features software-yubikey
 ```
+
+The `software-yubikey` feature replaces the USB YubiKey with an emulated one
+(`KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch]`) so the YubiKey tests in
+`tests/yubikey.rs` run without hardware. It is for tests only; never build a binary you use with it.
 
 ### Python CLI compatibility tests
 
@@ -214,6 +277,18 @@ uv run pytest
 The suite builds keepassxcr itself. It uses an installed `keepassxc-cli` from `$KEEPASSXC_CLI`, `PATH`, or `/Applications/KeePassXC.app` (`brew install --cask keepassxc` on macOS, `apt install keepassxc` on Debian/Ubuntu). Only when none is found does it build `keepassxc-cli` from the submodule, which needs cmake, Qt, Botan and KeePassXC's other build dependencies.
 
 The suite logs every command it runs and its exit code as it goes. Add `--log-cli-level=DEBUG` (e.g. `just compat --log-cli-level=DEBUG -k merge`) to also see each command's stdout and stderr; a failing test always prints its full log.
+
+### YubiKey differential tests
+
+```sh
+just compat-yubikey
+```
+
+Builds upstream KeePassXC 2.7.12's `keepassxc-cli` with only its YubiKey device call replaced by
+the same software key (`tests/keepassxc-software-yubikey.patch`, built by
+`tests/build-software-yubikey-keepassxc.sh`; needs KeePassXC's build dependencies with YubiKey
+support), then checks that databases written by either CLI open in the other for KDBX 4 and 3.1,
+both slot modes, with and without a password.
 
 ## KeePassXC submodule
 

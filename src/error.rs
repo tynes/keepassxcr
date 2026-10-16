@@ -31,6 +31,10 @@ pub enum AppError {
     #[error("clipboard error: {0}")]
     Clipboard(String),
 
+    /// YubiKey challenge-response failures.
+    #[error("YubiKey: {0}")]
+    YubiKey(String),
+
     /// The database's agent unlock expired; the command refuses to prompt.
     #[error("{0}")]
     Locked(String),

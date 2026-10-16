@@ -19,7 +19,7 @@ use crate::cli::{
     Command, DbCreateArgs, DbEditArgs, DbExportArgs, DbImportArgs, DbOpenArgs, DicewareArgs,
     EntryAddArgs, EntryEditArgs, EntryMoveArgs, EntryPathArgs, EntryShowArgs, EstimateArgs,
     GenerateArgs, GroupCreateArgs, GroupPathArgs, LockArgs, MergeArgs, PasswordOptionsArgs,
-    SearchArgs, UnlockArgs,
+    SearchArgs, UnlockArgs, YubiKeyCommand,
 };
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
@@ -66,6 +66,7 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
         Command::Unlock(args) => unlock(args).context("unlock failed"),
         Command::Lock(args) => lock(args).context("lock failed"),
         Command::Status(args) => status(args).context("status failed"),
+        Command::Yubikey(command) => yubikey(command).context("yubikey failed"),
         Command::Agent(args) => serve_agent(args).context("agent failed"),
     }
 }
@@ -166,6 +167,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
             .as_ref()
             .map(|path| KeyFile::load(path))
             .transpose()?,
+        yubikey: args.source_yubikey,
         agent: None,
     };
     let source = read_kdbx(&args.source, &source_credentials)?;
@@ -686,10 +688,36 @@ fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
             "unlock requires at least one credential".to_string(),
         )));
     }
-    // Fail on a wrong password now, not on the first command that uses the agent.
-    read_kdbx(&args.database, &credentials)?;
-    let raw_key = credentials.composite_key()?.raw_key();
-    let status = agent::unlock(&args.database, &raw_key, args.idle, args.max)?;
+    let key = credentials.composite_key()?.concatenated();
+    let status = agent::unlock(
+        &args.database,
+        &key,
+        credentials.yubikey,
+        args.idle,
+        args.max,
+    )?;
+    // Fail on a wrong password now, not on the first command that uses the
+    // agent. Opening through the agent also leaves it the YubiKey's answer
+    // for the current seed, so reads need no touch.
+    let through_agent = agent::credentials_for(&args.database)?;
+    let opened = match through_agent {
+        Some(key) => read_kdbx(
+            &args.database,
+            &Credentials {
+                password: None,
+                key_file: None,
+                yubikey: None,
+                agent: Some(key),
+            },
+        ),
+        None => Err(AppError::InvalidInput(
+            "agent started but does not answer".to_string(),
+        )),
+    };
+    if let Err(err) = opened {
+        agent::lock(Some(&args.database))?;
+        return Err(err.into());
+    }
     println!("Unlocked {}", describe_unlocked(&status));
     Ok(())
 }
@@ -741,12 +769,39 @@ fn status(args: LockArgs) -> anyhow::Result<()> {
 }
 
 fn describe_unlocked(status: &agent::AgentStatus) -> String {
+    let yubikey = status
+        .yubikey
+        .map(|slot| format!(", YubiKey slot {slot}"))
+        .unwrap_or_default();
     format!(
-        "{} (locks after {} idle, {} at most)",
+        "{} (locks after {} idle, {} at most{yubikey})",
         status.database.display(),
         format_duration(status.idle_left),
         format_duration(status.max_left),
     )
+}
+
+fn yubikey(command: YubiKeyCommand) -> anyhow::Result<()> {
+    match command {
+        YubiKeyCommand::Serve(args) => {
+            #[cfg(unix)]
+            {
+                let socket = match args.socket {
+                    Some(socket) => socket,
+                    None => crate::yubikey::forward::socket_path()?,
+                };
+                crate::yubikey::forward::serve(&socket)?;
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = args;
+                Err(anyhow::anyhow!(AppError::InvalidInput(
+                    "yubikey serve is only supported on Unix".to_string()
+                )))
+            }
+        }
+    }
 }
 
 fn serve_agent(args: crate::cli::AgentArgs) -> anyhow::Result<()> {
@@ -771,6 +826,7 @@ pub(crate) fn build_credentials(
         return Ok(Credentials {
             password: None,
             key_file: None,
+            yubikey: None,
             agent: Some(key),
         });
     }
@@ -792,7 +848,6 @@ fn build_credentials_with(
     confirm: bool,
 ) -> AppResult<Credentials> {
     args.validate()?;
-    reject_yubikey(args.yubikey)?;
     let password = if let Some(pass) = &args.password {
         warn_password_argument();
         Some(SecretString::new(pass.clone()))
@@ -822,6 +877,7 @@ fn build_credentials_with(
     Ok(Credentials {
         password,
         key_file,
+        yubikey: args.yubikey,
         agent: None,
     })
 }
@@ -854,22 +910,7 @@ fn warn_password_argument() {
     }
 }
 
-/// YubiKey challenge-response is not implemented compatibly with KeePassXC yet.
-///
-/// The challenge has to be sent to the key on every open and save, so a fixed
-/// response cannot work. Fail clearly instead of writing a database KeePassXC
-/// cannot open.
-fn reject_yubikey(slot: Option<u8>) -> AppResult<()> {
-    if slot.is_some() {
-        return Err(AppError::InvalidInput(
-            "YubiKey challenge-response is not supported yet".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<Credentials> {
-    reject_yubikey(args.new_yubikey)?;
     let password = if let Some(pass) = &args.new_password {
         warn_password_argument();
         Some(SecretString::new(pass.clone()))
@@ -885,9 +926,16 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
         current.key_file.clone()
     };
 
+    let yubikey = if args.unset_yubikey {
+        None
+    } else {
+        args.new_yubikey.or(current.yubikey)
+    };
+
     Ok(Credentials {
         password,
         key_file,
+        yubikey,
         agent: None,
     })
 }
@@ -1266,12 +1314,6 @@ mod tests {
         })
         .expect("password");
         assert_eq!(password.len(), 16);
-    }
-
-    #[test]
-    fn yubikey_is_rejected() {
-        assert!(reject_yubikey(Some(1)).is_err());
-        assert!(reject_yubikey(None).is_ok());
     }
 
     #[test]

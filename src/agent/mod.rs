@@ -1,9 +1,14 @@
 //! Background agent that keeps a database unlocked between commands.
 //!
 //! `keepassxcr unlock` starts one agent per database. The agent holds the
-//! composite key (password and key file hashed together, before the KDF) and
-//! answers KDF requests over a Unix socket only the same user can reach, so
-//! the key never leaves the agent and each command decrypts the file itself.
+//! composite key (password and key file, before the KDF) and answers KDF
+//! requests over a Unix socket only the same user can reach, so the key never
+//! leaves the agent and each command decrypts the file itself.
+//!
+//! With a YubiKey the agent also remembers the key's answer for each challenge
+//! (seed) it has seen, so reads need no touch until the file is saved with a
+//! new seed. On a miss the command asks the YubiKey itself and tells the agent;
+//! the agent never touches hardware.
 //! The agent never writes to a terminal: when it expires it leaves a marker
 //! file, and commands that find the marker fail instead of prompting.
 
@@ -14,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::KdfConfig;
 use crate::error::{AppError, AppResult};
+use crate::yubikey::YubiKeySlot;
 
 #[cfg(unix)]
 mod client;
@@ -32,16 +38,58 @@ pub use server::{harden_process, serve};
 pub struct AgentKey {
     socket: PathBuf,
     database: PathBuf,
+    yubikey: Option<YubiKeySlot>,
 }
 
 impl AgentKey {
-    /// Ask the agent to run `kdf` over its composite key.
-    pub fn transform(&self, kdf: &KdfConfig) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
+    /// Ask the agent to run `kdf` over its composite key, with a YubiKey
+    /// result appended first when given.
+    pub fn transform(
+        &self,
+        kdf: &KdfConfig,
+        challenge_response: Option<&[u8; 32]>,
+    ) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
         #[cfg(unix)]
-        return client::transform(self, kdf);
+        return client::transform(self, kdf, challenge_response);
         #[cfg(not(unix))]
         {
-            let _ = kdf;
+            let _ = (kdf, challenge_response);
+            Err(unsupported())
+        }
+    }
+
+    /// YubiKey slot the database was unlocked with, if any.
+    pub fn yubikey(&self) -> Option<YubiKeySlot> {
+        self.yubikey
+    }
+
+    /// The YubiKey result the agent remembers for `challenge`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the agent stopped.
+    pub fn recall(&self, challenge: &[u8]) -> AppResult<Option<[u8; 32]>> {
+        #[cfg(unix)]
+        return client::recall(self, challenge);
+        #[cfg(not(unix))]
+        {
+            let _ = challenge;
+            Err(unsupported())
+        }
+    }
+
+    /// Have the agent remember a YubiKey result that opened (or saved) the
+    /// database, so later commands need no touch for this seed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the agent stopped.
+    pub fn remember(&self, challenge: &[u8], response: &[u8; 32]) -> AppResult<()> {
+        #[cfg(unix)]
+        return client::remember(self, challenge, response);
+        #[cfg(not(unix))]
+        {
+            let _ = (challenge, response);
             Err(unsupported())
         }
     }
@@ -56,6 +104,8 @@ pub struct AgentStatus {
     pub idle_left: Duration,
     /// Time until the agent's hard maximum lifetime.
     pub max_left: Duration,
+    /// YubiKey slot the database was unlocked with, if any.
+    pub yubikey: Option<YubiKeySlot>,
 }
 
 /// Why and when an agent stopped by itself.
@@ -169,7 +219,8 @@ mod unsupported_platform {
 
     pub fn unlock(
         _database: &Path,
-        _raw_key: &[u8],
+        _key: &[u8],
+        _yubikey: Option<YubiKeySlot>,
         _idle: Duration,
         _max: Duration,
     ) -> AppResult<AgentStatus> {

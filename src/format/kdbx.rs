@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::agent::AgentKey;
 use crate::crypto::{
     CipherId, CompositeKey, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo, decrypt, encrypt,
-    hmac_sha256, kdbx_hmac_key,
+    hmac_sha256, kdbx_hmac_key, sha256,
 };
 use crate::error::{AppError, AppResult};
 use crate::format::block_stream::{
@@ -27,6 +27,7 @@ use crate::format::variant_map::{VariantValue, read_variant_map, write_variant_m
 use crate::model::Database;
 use crate::util::{read_u16_le, read_u32_le, read_u64_le, read_vec, write_u16_le, write_u32_le};
 use crate::xml::{BinaryPool, PoolBinary, read_database, requires_kdbx41, write_database};
+use crate::yubikey::{self, YubiKeySlot};
 
 /// Credentials for database operations.
 #[derive(Clone)]
@@ -35,6 +36,8 @@ pub struct Credentials {
     pub password: Option<SecretString>,
     /// Optional key file.
     pub key_file: Option<KeyFile>,
+    /// Optional YubiKey challenge-response slot.
+    pub yubikey: Option<YubiKeySlot>,
     /// Unlocked agent holding the composite key, used instead of the fields above.
     pub agent: Option<AgentKey>,
 }
@@ -45,13 +48,14 @@ impl std::fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("password", &self.password.is_some())
             .field("key_file", &self.key_file.is_some())
+            .field("yubikey", &self.yubikey)
             .field("agent", &self.agent)
             .finish()
     }
 }
 
 impl Credentials {
-    /// Build a composite key from credentials.
+    /// Build a composite key from the password and key file.
     pub fn composite_key(&self) -> AppResult<CompositeKey> {
         let mut composite = CompositeKey::new();
         if let Some(password) = &self.password {
@@ -65,21 +69,116 @@ impl Credentials {
 
     /// True if no credential components were provided.
     pub fn is_empty(&self) -> bool {
-        self.password.is_none() && self.key_file.is_none() && self.agent.is_none()
+        self.password.is_none()
+            && self.key_file.is_none()
+            && self.yubikey.is_none()
+            && self.agent.is_none()
     }
 
-    /// Run the KDF over the composite key, locally or in the unlocked agent.
+    /// SHA-256 of the YubiKey's answer to `challenge`, or `None` without a
+    /// YubiKey. This is what KeePassXC's `CompositeKey::challenge` returns.
+    ///
+    /// With the unlock agent, a result the agent remembers is used without
+    /// asking the YubiKey.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the YubiKey cannot be reached or does not answer.
+    fn challenge_response(&self, challenge: &[u8]) -> AppResult<Option<ChallengeResponse>> {
+        let slot = match &self.agent {
+            Some(agent) => {
+                if let Some(response) = agent.recall(challenge)? {
+                    return Ok(Some(ChallengeResponse {
+                        response,
+                        fresh: false,
+                    }));
+                }
+                agent.yubikey()
+            }
+            None => self.yubikey,
+        };
+        slot.map(|slot| {
+            Ok(ChallengeResponse {
+                response: sha256(&yubikey::challenge(slot, challenge)?[..]),
+                fresh: true,
+            })
+        })
+        .transpose()
+    }
+
+    /// Tell the unlock agent a YubiKey result that just worked.
+    fn keep(&self, keys: &DerivedKeys) -> AppResult<()> {
+        if let (Some(agent), Some(response)) = (&self.agent, &keys.challenge_response)
+            && response.fresh
+        {
+            agent.remember(&keys.challenge, &response.response)?;
+        }
+        Ok(())
+    }
+
+    /// Run the KDF over the composite key, locally or in the unlock agent.
+    ///
+    /// `challenge_response` is appended to the key components first (KDBX 4).
     /// The result is wiped when dropped.
-    pub fn transform_key(&self, kdf: &KdfConfig) -> AppResult<Zeroizing<Vec<u8>>> {
+    pub fn transform_key(
+        &self,
+        kdf: &KdfConfig,
+        challenge_response: Option<&[u8; 32]>,
+    ) -> AppResult<Zeroizing<Vec<u8>>> {
         if let Some(agent) = &self.agent {
-            return agent.transform(kdf);
+            return agent.transform(kdf, challenge_response);
         }
         let composite = self.composite_key()?;
-        if composite.is_empty() {
+        // A YubiKey alone is a valid key. In KDBX 3.1 its answer goes into the
+        // final key, so the KDF then runs over the hash of nothing, as upstream.
+        if composite.is_empty() && self.yubikey.is_none() {
             return Err(AppError::InvalidInput("empty composite key".to_string()));
         }
-        kdf.transform(&composite.raw_key())
+        kdf.transform(&composite.raw_key_with(challenge_response))
     }
+
+    /// Derive the KDF output and final key for a file with these seeds.
+    ///
+    /// KeePassXC challenges the YubiKey with the KDF seed in KDBX 4 and mixes
+    /// the answer in before the KDF, but with the master seed in KDBX 3.1 and
+    /// mixes it into the final key (`Kdbx3Reader.cpp`, `CompositeKey.cpp`).
+    fn derive_keys(
+        &self,
+        version: KdbxVersion,
+        kdf: &KdfConfig,
+        master_seed: &[u8],
+    ) -> AppResult<DerivedKeys> {
+        let kdbx4 = version.is_kdbx4();
+        let challenge = if kdbx4 { kdf.seed() } else { master_seed };
+        let challenge_response = self.challenge_response(challenge)?;
+        let response = challenge_response.as_ref().map(|result| &result.response);
+        let (before_kdf, in_final_key) = if kdbx4 {
+            (response, None)
+        } else {
+            (None, response)
+        };
+        let transformed = self.transform_key(kdf, before_kdf)?;
+        let final_key = build_final_key(master_seed, in_final_key, &transformed);
+        Ok(DerivedKeys {
+            transformed,
+            final_key,
+            challenge: challenge.to_vec(),
+            challenge_response,
+        })
+    }
+}
+
+/// A YubiKey result, and whether the YubiKey was just asked for it.
+struct ChallengeResponse {
+    response: [u8; 32],
+    fresh: bool,
+}
+
+struct DerivedKeys {
+    transformed: Zeroizing<Vec<u8>>,
+    final_key: Zeroizing<[u8; 32]>,
+    challenge: Vec<u8>,
+    challenge_response: Option<ChallengeResponse>,
 }
 
 /// Parsed KDBX file with settings and data.
@@ -207,16 +306,23 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
         ));
     }
 
-    let transformed = credentials.transform_key(&header.kdf)?;
-    let final_key = build_final_key(&header.master_seed, &transformed, credentials)?;
+    let keys = credentials.derive_keys(version, &header.kdf, &header.master_seed)?;
 
     let (payload, header_hash) = if version.is_kdbx4() {
-        let payload = read_kdbx4_payload(body, &header, header_data, &final_key[..], &transformed)?;
+        let payload = read_kdbx4_payload(
+            body,
+            &header,
+            header_data,
+            &keys.final_key[..],
+            &keys.transformed,
+        )?;
         (payload, None)
     } else {
-        let payload = read_kdbx3_payload(body, &header, &final_key[..])?;
+        let payload = read_kdbx3_payload(body, &header, &keys.final_key[..])?;
         (payload, Some(crate::crypto::sha256(header_data)))
     };
+    // Only a result that decrypted the file is worth remembering.
+    credentials.keep(&keys)?;
 
     let database = read_database(
         &payload.xml,
@@ -247,17 +353,24 @@ fn write_kdbx_bytes(file: &KdbxFile, credentials: &Credentials) -> AppResult<Vec
     let mut kdf = file.kdf.clone();
     randomize_kdf_seed(&mut kdf);
 
-    let transformed = credentials.transform_key(&kdf)?;
     let mut master_seed = vec![0u8; 32];
     OsRng.fill_bytes(&mut master_seed);
 
-    let final_key = build_final_key(&master_seed, &transformed, credentials)?;
+    let keys = credentials.derive_keys(file.version, &kdf, &master_seed)?;
 
-    if file.version.is_kdbx4() {
-        write_kdbx4(file, &kdf, &master_seed, &final_key[..], &transformed)
+    let data = if file.version.is_kdbx4() {
+        write_kdbx4(
+            file,
+            &kdf,
+            &master_seed,
+            &keys.final_key[..],
+            &keys.transformed,
+        )?
     } else {
-        write_kdbx3(file, &kdf, &master_seed, &final_key[..])
-    }
+        write_kdbx3(file, &kdf, &master_seed, &keys.final_key[..])?
+    };
+    credentials.keep(&keys)?;
+    Ok(data)
 }
 
 struct HeaderData {
@@ -394,13 +507,18 @@ fn le_u32(data: &[u8], what: &str) -> AppResult<u32> {
 
 fn build_final_key(
     master_seed: &[u8],
+    challenge_response: Option<&[u8; 32]>,
     transformed: &[u8],
-    _credentials: &Credentials,
-) -> AppResult<Zeroizing<[u8; 32]>> {
-    let mut buffer = Zeroizing::new(Vec::with_capacity(master_seed.len() + transformed.len()));
+) -> Zeroizing<[u8; 32]> {
+    let mut buffer = Zeroizing::new(Vec::with_capacity(
+        master_seed.len() + 32 + transformed.len(),
+    ));
     buffer.extend_from_slice(master_seed);
+    if let Some(response) = challenge_response {
+        buffer.extend_from_slice(response);
+    }
     buffer.extend_from_slice(transformed);
-    Ok(Zeroizing::new(crate::crypto::sha256(&buffer)))
+    Zeroizing::new(crate::crypto::sha256(&buffer))
 }
 
 /// The decrypted contents of a file. Every buffer is wiped when dropped.
@@ -928,6 +1046,7 @@ mod tests {
         let credentials = Credentials {
             password: Some(SecretString::new("pw".to_string())),
             key_file: None,
+            yubikey: None,
             agent: None,
         };
         (file, credentials)
@@ -1050,6 +1169,7 @@ mod tests {
         let wrong = Credentials {
             password: Some(SecretString::new("wrong".to_string())),
             key_file: None,
+            yubikey: None,
             agent: None,
         };
         for file in [file4, kdbx3_file()] {
