@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::str::contains;
 
 const PASSWORD: &str = "agent-test-password";
@@ -45,7 +46,7 @@ impl Fixture {
     /// `keepassxcr <args[0]> <db> <args[1..]>` with this fixture's runtime dir
     /// and no stdin, as in a script.
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("keepassxcr").unwrap();
+        let mut cmd = cargo_bin_cmd!("keepassxcr");
         cmd.env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("RUST_BACKTRACE", "0")
             .arg(args[0])
@@ -80,8 +81,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::cargo_bin("keepassxcr")
-            .unwrap()
+        let _ = cargo_bin_cmd!("keepassxcr")
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .arg("lock")
             .ok();
