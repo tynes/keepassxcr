@@ -212,7 +212,14 @@ fn totals(group: &Group) -> (usize, usize) {
 
 /// A readable dump of everything the model holds, for comparing two loads.
 fn describe(group: &Group, out: &mut Vec<String>) {
-    out.push(format!("group {} {}", group.uuid(), group.name()));
+    out.push(format!(
+        "group {} {} tags={:?} times={:?} previous={:?}",
+        group.uuid(),
+        group.name(),
+        group.tags(),
+        group.times(),
+        group.previous_parent_group()
+    ));
     for raw in group.extra() {
         out.push(format!("  group xml {}", raw.xml()));
     }
@@ -237,6 +244,12 @@ fn describe_entry(entry: &Entry, indent: &str, out: &mut Vec<String>) {
         entry.url(),
         entry.notes()
     ));
+    out.push(format!(
+        "{indent}  tags={:?} times={:?} previous={:?}",
+        entry.tags(),
+        entry.times(),
+        entry.previous_parent_group()
+    ));
     for (key, value) in entry.custom_fields() {
         let protected = entry.protected_fields().contains(key);
         out.push(format!(
@@ -260,8 +273,22 @@ fn snapshot(file: &keepassxcr::format::KdbxFile) -> Vec<String> {
         format!("meta name={:?}", file.database.meta().name()),
         format!("meta description={:?}", file.database.meta().description()),
     ];
-    for raw in file.database.meta().extra() {
+    let meta = file.database.meta();
+    out.push(format!(
+        "meta recycle bin enabled={} uuid={:?} changed={:?} limits={:?}",
+        meta.recycle_bin_enabled(),
+        meta.recycle_bin(),
+        meta.recycle_bin_changed(),
+        meta.history_limits()
+    ));
+    for icon in meta.custom_icons() {
+        out.push(format!("meta icon {}", icon.xml()));
+    }
+    for raw in meta.extra() {
         out.push(format!("meta xml {}", raw.xml()));
+    }
+    for object in file.database.deleted_objects() {
+        out.push(format!("deleted {object:?}"));
     }
     for raw in file.database.root_extra() {
         out.push(format!("root xml {}", raw.xml()));
@@ -435,4 +462,46 @@ fn truncated_and_corrupted_files_fail_cleanly() {
     assert!(open_bytes(&trailing, &credentials, &path));
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn recycle_bin_is_read_and_used() {
+    let credentials = credentials(Some("demopass"), None);
+    let mut file = read_kdbx(
+        &fixture("test_db_kdbx4_with_password_deleted_entry.kdbx"),
+        &credentials,
+    )
+    .expect("open");
+    let bin = uuid::uuid!("563171fe-6598-42dc-8003-f98dde32e872");
+    let meta = file.database.meta();
+    assert!(meta.recycle_bin_enabled());
+    assert_eq!(meta.recycle_bin(), Some(bin));
+    let bin_group = file.database.root().group_by_uuid(bin).expect("bin group");
+    assert_eq!(bin_group.name(), "Recycle Bin");
+
+    // Removing an entry puts it in the existing bin rather than a new one.
+    let groups_before = file.database.root().groups().len();
+    let entry = first_entry_outside(file.database.root(), bin).expect("an entry");
+    assert_eq!(
+        file.database.recycle_entry(entry),
+        Some(keepassxcr::model::Removal::Recycled)
+    );
+    assert_eq!(file.database.root().groups().len(), groups_before);
+    let reopened = save_and_reopen(&file, &credentials, "recycled.kdbx");
+    let bin_group = reopened.database.root().group_by_uuid(bin).expect("bin");
+    assert!(bin_group.entry_by_uuid(entry).is_some());
+    // Moving needs KDBX 4.1 for the previous parent group.
+    assert_eq!(reopened.version, KdbxVersion::V4_1);
+}
+
+fn first_entry_outside(group: &Group, skip: uuid::Uuid) -> Option<uuid::Uuid> {
+    if group.uuid() == skip {
+        return None;
+    }
+    group.entries().first().map(Entry::uuid).or_else(|| {
+        group
+            .groups()
+            .iter()
+            .find_map(|child| first_entry_outside(child, skip))
+    })
 }

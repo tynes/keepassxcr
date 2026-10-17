@@ -15,16 +15,21 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use secrecy::ExposeSecret;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::crypto::{ProtectedStream, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
-use crate::model::{Attachment, Database, Entry, Group, RawElement};
+use crate::model::{
+    Attachment, Database, DeletedObject, Entry, Group, HistoryLimits, RawElement, Times, Timestamp,
+};
 use zeroize::Zeroizing;
 
 /// Where the attachment pool is stored when writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It also picks the rest of the format: KDBX4 (`InnerHeader`) writes times
+/// as base64 seconds and the 4.1 elements, KDBX3 (`Meta`) writes ISO 8601
+/// times and leaves out elements that KDBX 3.1 does not have.
 pub enum BinaryPool {
     /// KDBX4: the pool is returned to the caller for the inner header.
     InnerHeader,
@@ -113,27 +118,22 @@ pub fn read_database(
 /// KeePassXC: group tags, a previous parent group, an entry excluded from
 /// reports, or a custom icon with a name or modification time.
 pub fn requires_kdbx41(database: &Database) -> bool {
-    let meta_needs = database.meta().extra().iter().any(|raw| {
-        raw.name() == "CustomIcons"
-            && (raw.xml().contains("<Name>") || raw.xml().contains("<LastModificationTime>"))
-    });
+    let meta_needs =
+        database.meta().custom_icons().iter().any(|icon| {
+            icon.xml().contains("<Name>") || icon.xml().contains("<LastModificationTime>")
+        });
     meta_needs || group_requires_kdbx41(database.root())
 }
 
 fn group_requires_kdbx41(group: &Group) -> bool {
-    let group_needs = group.extra().iter().any(|raw| match raw.name() {
-        "Tags" => crate::model::element_text(raw.xml(), "Tags")
-            .is_some_and(|tags| !tags.trim().is_empty()),
-        "PreviousParentGroup" => true,
-        _ => false,
-    });
+    let group_needs = !group.tags().trim().is_empty() || group.previous_parent_group().is_some();
     let entry_needs = group.entries().iter().any(|entry| {
-        entry.extra().iter().any(|raw| match raw.name() {
-            "PreviousParentGroup" => true,
-            "QualityCheck" => crate::model::element_text(raw.xml(), "QualityCheck")
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("false")),
-            _ => false,
-        })
+        entry.previous_parent_group().is_some()
+            || entry.extra().iter().any(|raw| {
+                raw.name() == "QualityCheck"
+                    && crate::model::element_text(raw.xml(), "QualityCheck")
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
+            })
     });
     group_needs || entry_needs || group.groups().iter().any(group_requires_kdbx41)
 }
@@ -172,16 +172,24 @@ pub fn write_database(
     } else {
         &[]
     };
-    write_meta(&mut writer, database, meta_pool, header_hash)?;
+    write_meta(
+        &mut writer,
+        database,
+        meta_pool,
+        header_hash,
+        pool == BinaryPool::InnerHeader,
+    )?;
 
     let mut ctx = WriteContext {
         stream: &mut stream,
         index: &index,
         protect_fields,
         memory_protection: MemoryProtection::of(database),
+        kdbx4: pool == BinaryPool::InnerHeader,
     };
     start(&mut writer, BytesStart::new("Root"))?;
     write_group(&mut writer, database.root(), &mut ctx)?;
+    write_deleted_objects(&mut writer, database.deleted_objects(), ctx.kdbx4)?;
     write_raw(&mut writer, database.root_extra())?;
     end(&mut writer, "Root")?;
 
@@ -342,10 +350,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_meta(&mut self, database: &mut Database) -> AppResult<()> {
+        let mut recycle_bin = None;
+        let mut recycle_bin_changed = None;
+        let mut limits = HistoryLimits::default();
         loop {
             match self.next_child()? {
                 Child::End => break,
                 Child::Start(name, _, pos) => match name.as_str() {
+                    "RecycleBinEnabled" => {
+                        let value = self.read_text()?;
+                        database
+                            .meta_mut()
+                            .set_recycle_bin_enabled(parse_bool(&value, true));
+                    }
+                    "RecycleBinUUID" => {
+                        recycle_bin = parse_uuid(&self.read_text()?)?;
+                    }
+                    "RecycleBinChanged" => {
+                        recycle_bin_changed = Timestamp::parse(&self.read_text()?);
+                    }
+                    "HistoryMaxItems" => {
+                        if let Ok(value) = self.read_text()?.trim().parse() {
+                            limits.max_items = value;
+                        }
+                    }
+                    "HistoryMaxSize" => {
+                        if let Ok(value) = self.read_text()?.trim().parse() {
+                            limits.max_size = value;
+                        }
+                    }
+                    "CustomIcons" => self.parse_custom_icons(database)?,
                     "DatabaseName" => {
                         let value = self.read_text()?;
                         database.meta_mut().set_name(value);
@@ -373,12 +407,105 @@ impl<'a> Parser<'a> {
                 Child::Empty(name, _, pos) => match name.as_str() {
                     "DatabaseName" => database.meta_mut().set_name(String::new()),
                     "DatabaseDescription" => database.meta_mut().set_description(String::new()),
-                    "Generator" | "HeaderHash" | "Binaries" => {}
+                    "Generator" | "HeaderHash" | "Binaries" | "CustomIcons" | "RecycleBinUUID"
+                    | "RecycleBinEnabled" | "RecycleBinChanged" | "HistoryMaxItems"
+                    | "HistoryMaxSize" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         database.meta_mut().extra_mut().push(raw);
                     }
                 },
+            }
+        }
+        let changed = recycle_bin_changed.unwrap_or_else(|| database.meta().recycle_bin_changed());
+        database.meta_mut().load_recycle_bin(recycle_bin, changed);
+        database.meta_mut().set_history_limits(limits);
+        Ok(())
+    }
+
+    /// Keep each `Meta/CustomIcons/Icon` as written.
+    fn parse_custom_icons(&mut self, database: &mut Database) -> AppResult<()> {
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, pos) => {
+                    let raw = self.capture(&name, pos)?;
+                    if name == "Icon" {
+                        database.meta_mut().custom_icons_mut().push(raw);
+                    }
+                }
+                Child::Empty(..) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a `Times` block. Unknown children are dropped, and a missing
+    /// or unreadable time is the current time, as in KeePassXC.
+    fn parse_times(&mut self) -> AppResult<Times> {
+        let mut times = Times::now();
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, _) => {
+                    let text = self.read_text()?;
+                    let stamp = Timestamp::parse(&text);
+                    match name.as_str() {
+                        "CreationTime" => times.creation = stamp.unwrap_or(times.creation),
+                        "LastModificationTime" => {
+                            times.last_modification = stamp.unwrap_or(times.last_modification);
+                        }
+                        "LastAccessTime" => times.last_access = stamp.unwrap_or(times.last_access),
+                        "ExpiryTime" => times.expiry = stamp.unwrap_or(times.expiry),
+                        "LocationChanged" => {
+                            times.location_changed = stamp.unwrap_or(times.location_changed);
+                        }
+                        "Expires" => times.expires = parse_bool(&text, false),
+                        "UsageCount" => times.usage_count = text.trim().parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+                Child::Empty(..) => {}
+            }
+        }
+        Ok(times)
+    }
+
+    fn parse_deleted_objects(&mut self, database: &mut Database) -> AppResult<()> {
+        loop {
+            match self.next_child()? {
+                Child::End => break,
+                Child::Start(name, _, _) if name == "DeletedObject" => {
+                    let mut uuid = None;
+                    let mut deletion_time = None;
+                    loop {
+                        match self.next_child()? {
+                            Child::End => break,
+                            Child::Start(name, _, _) => {
+                                let text = self.read_text()?;
+                                match name.as_str() {
+                                    "UUID" => uuid = parse_uuid(&text)?,
+                                    "DeletionTime" => deletion_time = Timestamp::parse(&text),
+                                    _ => {}
+                                }
+                            }
+                            Child::Empty(..) => {}
+                        }
+                    }
+                    // Like KeePassXC, a record needs both fields.
+                    if let (Some(uuid), Some(deletion_time)) = (uuid, deletion_time) {
+                        database.deleted_objects_mut().push(DeletedObject {
+                            uuid,
+                            deletion_time,
+                        });
+                    }
+                }
+                Child::Start(name, _, _) => {
+                    self.reader
+                        .read_to_end(QName(name.as_str()))
+                        .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
+                }
+                Child::Empty(..) => {}
             }
         }
         Ok(())
@@ -432,10 +559,14 @@ impl<'a> Parser<'a> {
                 Child::Start(name, _, _) if name == "Group" && root_group.is_none() => {
                     root_group = Some(self.parse_group()?);
                 }
+                Child::Start(name, _, _) if name == "DeletedObjects" => {
+                    self.parse_deleted_objects(database)?;
+                }
                 Child::Start(name, _, pos) => {
                     let raw = self.capture(&name, pos)?;
                     database.root_extra_mut().push(raw);
                 }
+                Child::Empty(name, _, _) if name == "DeletedObjects" => {}
                 Child::Empty(name, _, pos) => {
                     let raw = self.raw_since(&name, pos)?;
                     database.root_extra_mut().push(raw);
@@ -468,10 +599,19 @@ impl<'a> Parser<'a> {
             match self.next_child()? {
                 Child::End => break,
                 Child::Start(name, _, pos) => match name.as_str() {
-                    "UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    "UUID" => uuid = parse_uuid(&self.read_text()?)?,
                     "Name" => {
                         let value = self.read_text()?;
                         group.set_name(value);
+                    }
+                    "Tags" => {
+                        let value = self.read_text()?;
+                        group.set_tags(value);
+                    }
+                    "Times" => *group.times_mut() = self.parse_times()?,
+                    "PreviousParentGroup" => {
+                        let value = parse_uuid(&self.read_text()?)?;
+                        group.set_previous_parent_group(value);
                     }
                     "Entry" => {
                         let entry = self.parse_entry()?;
@@ -488,7 +628,7 @@ impl<'a> Parser<'a> {
                 },
                 Child::Empty(name, _, pos) => match name.as_str() {
                     "Name" => group.set_name(String::new()),
-                    "UUID" | "Entry" | "Group" => {}
+                    "UUID" | "Entry" | "Group" | "Tags" | "PreviousParentGroup" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         group.extra_mut().push(raw);
@@ -516,7 +656,16 @@ impl<'a> Parser<'a> {
             match self.next_child()? {
                 Child::End => break,
                 Child::Start(name, _, pos) => match name.as_str() {
-                    "UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    "UUID" => uuid = parse_uuid(&self.read_text()?)?,
+                    "Tags" => {
+                        let value = self.read_text()?;
+                        entry.set_tags(&value);
+                    }
+                    "Times" => *entry.times_mut() = self.parse_times()?,
+                    "PreviousParentGroup" => {
+                        let value = parse_uuid(&self.read_text()?)?;
+                        entry.set_previous_parent_group(value);
+                    }
                     "String" => {
                         let (key, value, protected) = self.parse_string()?;
                         entry.set_protected(&key, protected);
@@ -541,7 +690,7 @@ impl<'a> Parser<'a> {
                     }
                 },
                 Child::Empty(name, _, pos) => match name.as_str() {
-                    "UUID" | "String" | "Binary" | "History" => {}
+                    "UUID" | "String" | "Binary" | "History" | "Tags" | "PreviousParentGroup" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         entry.extra_mut().push(raw);
@@ -722,9 +871,24 @@ fn decode_base64(text: &str, what: &str) -> AppResult<Vec<u8>> {
         .map_err(|_| AppError::Xml(format!("invalid {what} base64")))
 }
 
-fn parse_uuid(text: &str) -> AppResult<Uuid> {
+/// Parse a base64 UUID; the all-zero UUID, which KeePassXC writes for
+/// "none", is `None`.
+fn parse_uuid(text: &str) -> AppResult<Option<Uuid>> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
     let decoded = decode_base64(text, "UUID")?;
-    Uuid::from_slice(&decoded).map_err(|_| AppError::Xml("invalid UUID bytes".to_string()))
+    let uuid =
+        Uuid::from_slice(&decoded).map_err(|_| AppError::Xml("invalid UUID bytes".to_string()))?;
+    Ok((!uuid.is_nil()).then_some(uuid))
+}
+
+fn parse_bool(text: &str, default: bool) -> bool {
+    match text.trim() {
+        value if value.eq_ignore_ascii_case("true") => true,
+        value if value.eq_ignore_ascii_case("false") => false,
+        _ => default,
+    }
 }
 
 // ─── Writing ────────────────────────────────────────────────────────────────
@@ -734,6 +898,8 @@ struct WriteContext<'a> {
     index: &'a PoolIndex,
     protect_fields: bool,
     memory_protection: MemoryProtection,
+    /// KDBX4 time encoding and 4.1 elements; see [`BinaryPool`].
+    kdbx4: bool,
 }
 
 /// Pool position of each distinct (data, protection flag) pair.
@@ -852,6 +1018,7 @@ fn write_meta<W: std::io::Write>(
     database: &Database,
     binaries: &[PoolBinary],
     header_hash: Option<&[u8]>,
+    kdbx4: bool,
 ) -> AppResult<()> {
     start(writer, BytesStart::new("Meta"))?;
     write_simple_element(writer, "Generator", "keepassxcr")?;
@@ -861,7 +1028,28 @@ fn write_meta<W: std::io::Write>(
     }
     write_simple_element(writer, "DatabaseName", database.meta().name())?;
     write_simple_element(writer, "DatabaseDescription", database.meta().description())?;
-    write_raw(writer, database.meta().extra())?;
+    let meta = database.meta();
+    if !meta.custom_icons().is_empty() {
+        start(writer, BytesStart::new("CustomIcons"))?;
+        write_raw(writer, meta.custom_icons())?;
+        end(writer, "CustomIcons")?;
+    }
+    write_bool(writer, "RecycleBinEnabled", meta.recycle_bin_enabled())?;
+    write_uuid_element(
+        writer,
+        "RecycleBinUUID",
+        meta.recycle_bin().unwrap_or(Uuid::nil()),
+    )?;
+    write_time(
+        writer,
+        "RecycleBinChanged",
+        meta.recycle_bin_changed(),
+        kdbx4,
+    )?;
+    let limits = meta.history_limits();
+    write_simple_element(writer, "HistoryMaxItems", &limits.max_items.to_string())?;
+    write_simple_element(writer, "HistoryMaxSize", &limits.max_size.to_string())?;
+    write_raw(writer, meta.extra())?;
 
     if !binaries.is_empty() {
         start(writer, BytesStart::new("Binaries"))?;
@@ -885,8 +1073,15 @@ fn write_group<W: std::io::Write>(
     start(writer, BytesStart::new("Group"))?;
     write_uuid(writer, group.uuid())?;
     write_simple_element(writer, "Name", group.name())?;
-    if !group.extra().iter().any(|raw| raw.name() == "Times") {
-        write_times(writer, OffsetDateTime::now_utc())?;
+    // Group tags and the previous parent are KDBX 4.1 only.
+    if ctx.kdbx4 && !group.tags().is_empty() {
+        write_simple_element(writer, "Tags", group.tags())?;
+    }
+    write_times(writer, group.times(), ctx.kdbx4)?;
+    if ctx.kdbx4
+        && let Some(previous) = group.previous_parent_group()
+    {
+        write_uuid_element(writer, "PreviousParentGroup", previous)?;
     }
     write_raw(writer, group.extra())?;
 
@@ -907,24 +1102,16 @@ fn write_entry<W: std::io::Write>(
 ) -> AppResult<()> {
     start(writer, BytesStart::new("Entry"))?;
     write_uuid(writer, entry.uuid())?;
-
-    let has_times = entry.extra().iter().any(|raw| raw.name() == "Times");
-    if !has_times {
-        write_times(
-            writer,
-            entry.modified().unwrap_or_else(OffsetDateTime::now_utc),
-        )?;
+    if !entry.tags().is_empty() {
+        write_simple_element(writer, "Tags", &entry.tags().join(","))?;
     }
-    for raw in entry.extra() {
-        match (raw.name(), entry.modified()) {
-            ("Times", Some(modified)) => {
-                let updated =
-                    replace_element_text(raw.xml(), "LastModificationTime", &format_time(modified));
-                write_raw(writer, &[RawElement::new("Times".to_string(), updated)])?;
-            }
-            _ => write_raw(writer, std::slice::from_ref(raw))?,
-        }
+    write_times(writer, entry.times(), ctx.kdbx4)?;
+    if ctx.kdbx4
+        && let Some(previous) = entry.previous_parent_group()
+    {
+        write_uuid_element(writer, "PreviousParentGroup", previous)?;
     }
+    write_raw(writer, entry.extra())?;
 
     // Like KeePassXC: a field is protected if the entry says so or the
     // database's memory-protection settings cover it.
@@ -1004,53 +1191,73 @@ fn write_attachment_ref<W: std::io::Write>(
 }
 
 fn write_uuid<W: std::io::Write>(writer: &mut Writer<W>, uuid: Uuid) -> AppResult<()> {
+    write_uuid_element(writer, "UUID", uuid)
+}
+
+fn write_uuid_element<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    name: &str,
+    uuid: Uuid,
+) -> AppResult<()> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(uuid.as_bytes());
-    write_simple_element(writer, "UUID", &encoded)
+    write_simple_element(writer, name, &encoded)
 }
 
-/// Format a timestamp the way KeePass XML expects (ISO 8601, UTC, whole seconds).
-fn format_time(time: OffsetDateTime) -> String {
-    let time = time.to_offset(time::UtcOffset::UTC);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        time.year(),
-        u8::from(time.month()),
-        time.day(),
-        time.hour(),
-        time.minute(),
-        time.second()
-    )
+fn write_bool<W: std::io::Write>(writer: &mut Writer<W>, name: &str, value: bool) -> AppResult<()> {
+    write_simple_element(writer, name, if value { "True" } else { "False" })
 }
 
-/// Replace the text of `<tag>…</tag>` in a snippet, or insert the element if missing.
-fn replace_element_text(xml: &str, tag: &str, value: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    if let Some(start) = xml.find(&open).map(|pos| pos + open.len())
-        && let Some(len) = xml[start..].find(&close)
-    {
-        return format!("{}{}{}", &xml[..start], value, &xml[start + len..]);
+/// Write a time as KeePassXC does: base64 seconds for KDBX4, ISO 8601 for KDBX3.
+fn write_time<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    name: &str,
+    time: Timestamp,
+    kdbx4: bool,
+) -> AppResult<()> {
+    let text = if kdbx4 {
+        time.to_base64()
+    } else {
+        time.to_iso()
+    };
+    write_simple_element(writer, name, &text)
+}
+
+fn write_deleted_objects<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    deleted: &[DeletedObject],
+    kdbx4: bool,
+) -> AppResult<()> {
+    if deleted.is_empty() {
+        return Ok(());
     }
-    match xml.rfind("</") {
-        Some(pos) => format!("{}{open}{value}{close}{}", &xml[..pos], &xml[pos..]),
-        None => xml.to_string(),
+    start(writer, BytesStart::new("DeletedObjects"))?;
+    for object in deleted {
+        start(writer, BytesStart::new("DeletedObject"))?;
+        write_uuid(writer, object.uuid)?;
+        write_time(writer, "DeletionTime", object.deletion_time, kdbx4)?;
+        end(writer, "DeletedObject")?;
     }
+    end(writer, "DeletedObjects")
 }
 
-fn write_times<W: std::io::Write>(writer: &mut Writer<W>, time: OffsetDateTime) -> AppResult<()> {
-    let formatted = format_time(time);
+fn write_times<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    times: &Times,
+    kdbx4: bool,
+) -> AppResult<()> {
     start(writer, BytesStart::new("Times"))?;
-    for field in [
-        "CreationTime",
+    write_time(writer, "CreationTime", times.creation, kdbx4)?;
+    write_time(
+        writer,
         "LastModificationTime",
-        "LastAccessTime",
-        "ExpiryTime",
-        "LocationChanged",
-    ] {
-        write_simple_element(writer, field, &formatted)?;
-    }
-    write_simple_element(writer, "Expires", "False")?;
-    write_simple_element(writer, "UsageCount", "0")?;
+        times.last_modification,
+        kdbx4,
+    )?;
+    write_time(writer, "LastAccessTime", times.last_access, kdbx4)?;
+    write_time(writer, "ExpiryTime", times.expiry, kdbx4)?;
+    write_bool(writer, "Expires", times.expires)?;
+    write_simple_element(writer, "UsageCount", &times.usage_count.to_string())?;
+    write_time(writer, "LocationChanged", times.location_changed, kdbx4)?;
     end(writer, "Times")
 }
 
@@ -1119,7 +1326,7 @@ mod tests {
     fn history_does_not_replace_current_values() {
         let mut entry = Entry::new("Bank".to_string());
         entry.set_password(SecretString::new("old".to_string()));
-        entry.begin_update();
+        entry.begin_update(HistoryLimits::default());
         entry.set_password(SecretString::new("current".to_string()));
         let mut db = Database::new("Root".to_string());
         db.root_mut().entries_mut().push(entry);
@@ -1139,7 +1346,7 @@ mod tests {
 <Root><Group><UUID>AAAAAAAAAAAAAAAAAAAAAA==</UUID><Name>Root</Name><Notes>group notes</Notes>
 <Entry><UUID>AQEBAQEBAQEBAQEBAQEBAQ==</UUID><Tags>a;b</Tags><Times><Expires>True</Expires></Times>
 <String><Key>Title</Key><Value>E</Value></String><AutoType><Enabled>True</Enabled></AutoType></Entry>
-</Group><DeletedObjects><DeletedObject><UUID>AgICAgICAgICAgICAgICAg==</UUID></DeletedObject></DeletedObjects></Root></KeePassFile>"#;
+</Group><DeletedObjects><DeletedObject><UUID>AgICAgICAgICAgICAgICAg==</UUID><DeletionTime>2024-01-01T00:00:00Z</DeletionTime></DeletedObject></DeletedObjects></Root></KeePassFile>"#;
         let db = read_database(xml, &[], &KEY, ProtectedStreamAlgo::Salsa20, None).expect("read");
         let output = write_database(
             &db,
@@ -1154,10 +1361,11 @@ mod tests {
         for needle in [
             "<RecycleBinEnabled>True</RecycleBinEnabled>",
             "<Notes>group notes</Notes>",
-            "<Tags>a;b</Tags>",
+            "<Tags>a,b</Tags>",
             "<Expires>True</Expires>",
             "<AutoType><Enabled>True</Enabled></AutoType>",
-            "<DeletedObjects>",
+            "<DeletedObject>",
+            "<UUID>AgICAgICAgICAgICAgICAg==</UUID>",
         ] {
             assert!(text.contains(needle), "missing {needle} in {text}");
         }
@@ -1169,7 +1377,7 @@ mod tests {
         entry
             .attachments_mut()
             .push(Attachment::new("a.txt".to_string(), b"hello".to_vec()));
-        entry.begin_update();
+        entry.begin_update(HistoryLimits::default());
         let mut db = Database::new("Root".to_string());
         db.root_mut().entries_mut().push(entry);
 
@@ -1348,15 +1556,77 @@ mod tests {
     }
 
     #[test]
-    fn modified_time_updates_preserved_times() {
-        let updated = replace_element_text(
-            "<Times><LastModificationTime>x</LastModificationTime></Times>",
-            "LastModificationTime",
-            "2024-01-01T00:00:00Z",
+    fn times_tags_and_deletions_survive_a_save() {
+        let mut db = Database::new("Root".to_string());
+        let mut entry = Entry::new("E".to_string());
+        entry.set_tags("b;a");
+        entry.times_mut().creation = Timestamp::from_secs(63_000_000_000);
+        entry.times_mut().expires = true;
+        entry.times_mut().usage_count = 7;
+        let previous = Uuid::new_v4();
+        entry.set_previous_parent_group(Some(previous));
+        let mut group = Group::new("G".to_string());
+        group.set_tags("x".to_string());
+        group.times_mut().expiry = Timestamp::from_secs(1);
+        group.entries_mut().push(entry);
+        db.root_mut().groups_mut().push(group);
+        let gone = Uuid::new_v4();
+        db.deleted_objects_mut().push(DeletedObject {
+            uuid: gone,
+            deletion_time: Timestamp::from_secs(63_800_000_000),
+        });
+        let bin = Uuid::new_v4();
+        db.meta_mut().set_recycle_bin(Some(bin));
+        db.meta_mut().set_recycle_bin_enabled(false);
+        db.meta_mut().set_history_limits(HistoryLimits {
+            max_items: 3,
+            max_size: -1,
+        });
+
+        for pool in [BinaryPool::InnerHeader, BinaryPool::Meta] {
+            let parsed = roundtrip(&db, pool);
+            let group = &parsed.root().groups()[0];
+            let entry = &group.entries()[0];
+            assert_eq!(entry.tags(), ["a", "b"]);
+            assert_eq!(entry.times(), db.root().groups()[0].entries()[0].times());
+            assert_eq!(group.times().expiry, Timestamp::from_secs(1));
+            assert_eq!(parsed.deleted_objects(), db.deleted_objects());
+            assert_eq!(parsed.meta().recycle_bin(), Some(bin));
+            assert!(!parsed.meta().recycle_bin_enabled());
+            assert_eq!(parsed.meta().history_limits().max_items, 3);
+            assert_eq!(parsed.meta().history_limits().max_size, -1);
+            // 4.1 elements are only written to KDBX4.
+            let kdbx4 = pool == BinaryPool::InnerHeader;
+            assert_eq!(entry.previous_parent_group().is_some(), kdbx4);
+            assert_eq!(group.tags() == "x", kdbx4);
+        }
+
+        let text = written(&db);
+        let creation = Timestamp::from_secs(63_000_000_000).to_base64();
+        assert!(
+            text.contains(&format!("<CreationTime>{creation}</CreationTime>")),
+            "{text}"
         );
+    }
+
+    #[test]
+    fn keepassxc_times_in_both_encodings_are_read() {
+        let db = parse(
+            "<KeePassFile><Root><Group><Name>R</Name>\
+             <Times><LastModificationTime>2024-01-01T00:00:00Z</LastModificationTime>\
+             <Expires>True</Expires><Bogus>1</Bogus></Times>\
+             <Entry><Times><LastModificationTime>AAAAAAAAAAA=</LastModificationTime>\
+             <UsageCount>3</UsageCount></Times></Entry>\
+             </Group></Root></KeePassFile>",
+        )
+        .expect("parse");
+        let root = db.root();
         assert_eq!(
-            updated,
-            "<Times><LastModificationTime>2024-01-01T00:00:00Z</LastModificationTime></Times>"
+            root.times().last_modification.to_iso(),
+            "2024-01-01T00:00:00Z"
         );
+        assert!(root.times().expires);
+        assert_eq!(root.entries()[0].times().last_modification.secs(), 0);
+        assert_eq!(root.entries()[0].times().usage_count, 3);
     }
 }

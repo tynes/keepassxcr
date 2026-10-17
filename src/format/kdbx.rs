@@ -988,13 +988,7 @@ mod tests {
         let read = read_kdbx_bytes(&saved, &credentials).expect("read");
         assert_eq!(read.version, KdbxVersion::V4_0);
 
-        file.database
-            .root_mut()
-            .extra_mut()
-            .push(crate::model::RawElement::new(
-                "Tags".to_string(),
-                "<Tags>work</Tags>".to_string(),
-            ));
+        file.database.root_mut().set_tags("work".to_string());
         let saved = write_kdbx_bytes(&file, &credentials).expect("write");
         let read = read_kdbx_bytes(&saved, &credentials).expect("read");
         assert_eq!(read.version, KdbxVersion::V4_1);

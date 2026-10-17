@@ -121,13 +121,13 @@ for one command; `db-edit` always does, and locks the agent once the credentials
 | **Entries** | `add` | Add an entry |
 | | `edit` | Edit an entry |
 | | `show` | Show an entry |
-| | `rm` | Remove an entry |
+| | `rm` | Remove an entry (moved to the recycle bin first, like KeePassXC) |
 | | `mv` | Move an entry to a group |
 | | `clip` | Copy a field to the clipboard |
 | | `search` | Search entries by term |
 | **Groups** | `ls` | List group contents |
 | | `mkdir` | Create a group |
-| | `rmdir` | Remove a group |
+| | `rmdir` | Remove a group (moved to the recycle bin first, like KeePassXC) |
 | **Attachments** | `attachment-import` | Import an attachment |
 | | `attachment-export` | Export an attachment |
 | | `attachment-rm` | Remove an attachment |
