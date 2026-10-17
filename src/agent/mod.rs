@@ -36,7 +36,7 @@ pub struct AgentKey {
 
 impl AgentKey {
     /// Ask the agent to run `kdf` over its composite key.
-    pub fn transform(&self, kdf: &KdfConfig) -> AppResult<Vec<u8>> {
+    pub fn transform(&self, kdf: &KdfConfig) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
         #[cfg(unix)]
         return client::transform(self, kdf);
         #[cfg(not(unix))]

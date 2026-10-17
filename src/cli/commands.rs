@@ -27,6 +27,9 @@ use crate::format::{Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, 
 use crate::model::{Attachment, Database, Entry, Group, Removal, placeholders};
 use crate::xml::{BinaryPool, write_database};
 
+/// Seconds before `clip` clears the clipboard, as in keepassxc-cli.
+const DEFAULT_CLIP_TIMEOUT_SECS: u64 = 10;
+
 /// Dispatch CLI commands.
 pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
     match cli.command {
@@ -152,7 +155,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
         }
         None if args.source_key_file.is_none() => {
             let password = read_secret("Password for source database: ")?;
-            (!password.is_empty()).then(|| SecretString::new(password))
+            (!password.is_empty()).then(|| into_secret(password))
         }
         None => None,
     };
@@ -261,16 +264,20 @@ fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
 
     let password = if args.password_prompt {
         let value = read_secret("Entry password: ")?;
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            Some(into_secret(value))
+        }
     } else if args.generate {
-        Some(generate_password(password_options_from_args(
-            &args.password_options,
-        ))?)
+        Some(SecretString::new(generate_password(
+            password_options_from_args(&args.password_options),
+        )?))
     } else {
         None
     };
     if let Some(pass) = password {
-        entry.set_password(SecretString::new(pass));
+        entry.set_password(pass);
     }
 
     group.entries_mut().push(entry);
@@ -305,16 +312,20 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
 
     let password = if args.password_prompt {
         let value = read_secret("Entry password: ")?;
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            Some(into_secret(value))
+        }
     } else if args.generate {
-        Some(generate_password(password_options_from_args(
-            &args.password_options,
-        ))?)
+        Some(SecretString::new(generate_password(
+            password_options_from_args(&args.password_options),
+        )?))
     } else {
         None
     };
     if let Some(pass) = password {
-        entry.set_password(SecretString::new(pass));
+        entry.set_password(pass);
     }
 
     write_kdbx(&args.database, &file, &credentials)?;
@@ -506,7 +517,16 @@ fn attachment_export(args: AttachmentExportArgs) -> anyhow::Result<()> {
         .ok_or_else(|| AppError::InvalidInput("attachment not found".to_string()))?;
 
     if let Some(output) = args.output {
-        fs::write(output, attachment.data())?;
+        // Attachments are often secrets: never replace an existing file, and
+        // keep the new one readable by its owner only.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut out = options
+            .open(&output)
+            .with_context(|| format!("cannot create {}", output.display()))?;
+        out.write_all(attachment.data())?;
     } else {
         io::stdout().write_all(attachment.data())?;
     }
@@ -558,14 +578,21 @@ fn clip(args: ClipArgs) -> anyhow::Result<()> {
         .set_text(value.as_str())
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
 
-    if let Some(timeout) = args.timeout {
+    println!("Copied {} to clipboard.", args.field);
+
+    // Like keepassxc-cli: clear after 10 seconds unless told otherwise, and
+    // only if the clipboard still holds what we put there.
+    let timeout = args.timeout.unwrap_or(DEFAULT_CLIP_TIMEOUT_SECS);
+    if timeout > 0 {
+        println!("Clearing the clipboard in {timeout} seconds...");
         thread::sleep(Duration::from_secs(timeout));
-        if let Err(err) = clipboard.set_text("") {
+        let unchanged = clipboard
+            .get_text()
+            .is_ok_and(|current| current == value.as_str());
+        if unchanged && let Err(err) = clipboard.clear() {
             error!("Failed to clear clipboard: {err}");
         }
     }
-
-    println!("Copied {} to clipboard.", args.field);
     Ok(())
 }
 
@@ -782,7 +809,7 @@ fn build_credentials_with(
         if prompt.is_empty() {
             None
         } else {
-            Some(SecretString::new(prompt))
+            Some(into_secret(prompt))
         }
     };
 
@@ -801,13 +828,20 @@ fn build_credentials_with(
 
 /// Read a secret from the terminal without echo, or a line from stdin when
 /// stdin is not a terminal (so passwords can be piped in, like keepassxc-cli).
-fn read_secret(prompt: &str) -> io::Result<String> {
+fn read_secret(prompt: &str) -> io::Result<Zeroizing<String>> {
     if io::stdin().is_terminal() {
-        return rpassword::prompt_password(prompt);
+        return rpassword::prompt_password(prompt).map(Zeroizing::new);
     }
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    let len = line.trim_end_matches(['\r', '\n']).len();
+    line.truncate(len);
+    Ok(line)
+}
+
+/// Move a wiped-on-drop secret into a `SecretString` without copying it.
+fn into_secret(mut value: Zeroizing<String>) -> SecretString {
+    SecretString::new(std::mem::take(&mut *value))
 }
 
 /// Warn that passwords given as arguments are visible to other local users.

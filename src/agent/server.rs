@@ -155,7 +155,7 @@ impl Agent {
                 let key = self.state().key.clone();
                 lock_memory(&key);
                 let transformed = match kdf.transform(&key) {
-                    Ok(transformed) => Zeroizing::new(transformed),
+                    Ok(transformed) => transformed,
                     Err(err) => return error_response(err.to_string()),
                 };
                 lock_memory(&transformed);
@@ -169,7 +169,7 @@ impl Agent {
         };
         Response {
             database: Some(self.location.database.clone()),
-            transformed: Some(hex::encode(&transformed[..])),
+            transformed: Some(Zeroizing::new(hex::encode(&transformed[..]))),
             ..Response::default()
         }
     }

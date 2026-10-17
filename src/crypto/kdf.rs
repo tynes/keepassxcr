@@ -2,6 +2,7 @@ use argon2::{Algorithm, Argon2, Block, Params, Version};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::constants::{KDF_AES_KDBX3, KDF_AES_KDBX4, KDF_ARGON2D, KDF_ARGON2ID};
 use crate::crypto::hash::sha256;
@@ -99,8 +100,8 @@ impl KdfConfig {
         }
     }
 
-    /// Transform a raw composite key.
-    pub fn transform(&self, raw_key: &[u8]) -> AppResult<Vec<u8>> {
+    /// Transform a raw composite key. The result is wiped when dropped.
+    pub fn transform(&self, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
         match self {
             Self::Aes { seed, rounds, .. } => aes_kdf(seed, *rounds, raw_key),
             Self::Argon2 {
@@ -144,7 +145,7 @@ impl KdfConfig {
     }
 }
 
-fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Vec<u8>> {
+fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     use aes::Aes256;
     use cipher::generic_array::GenericArray;
     use cipher::{BlockEncrypt, KeyInit};
@@ -200,10 +201,12 @@ fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Vec<u8>> {
         pb.finish_and_clear();
     }
 
-    let mut transformed = [0u8; 32];
+    let mut transformed = Zeroizing::new([0u8; 32]);
     transformed[..16].copy_from_slice(&block1);
     transformed[16..].copy_from_slice(&block2);
-    Ok(sha256(&transformed).to_vec())
+    block1.as_mut_slice().zeroize();
+    block2.as_mut_slice().zeroize();
+    Ok(Zeroizing::new(sha256(&transformed[..]).to_vec()))
 }
 
 fn argon2_kdf(
@@ -214,7 +217,7 @@ fn argon2_kdf(
     parallelism: u32,
     version: u32,
     raw_key: &[u8],
-) -> AppResult<Vec<u8>> {
+) -> AppResult<Zeroizing<Vec<u8>>> {
     let alg = match kind {
         KdfType::Argon2d => Algorithm::Argon2d,
         KdfType::Argon2id => Algorithm::Argon2id,
@@ -244,10 +247,11 @@ fn argon2_kdf(
     blocks.resize(block_count, Block::default());
     let argon2 = Argon2::new(alg, ver, params);
 
-    let mut output = vec![0u8; 32];
-    argon2
-        .hash_password_into_with_memory(raw_key, salt, &mut output, &mut blocks)
-        .map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
+    let mut output = Zeroizing::new(vec![0u8; 32]);
+    let result = argon2.hash_password_into_with_memory(raw_key, salt, &mut output, &mut blocks);
+    // The working memory is derived from the key.
+    blocks.zeroize();
+    result.map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
     Ok(output)
 }
 

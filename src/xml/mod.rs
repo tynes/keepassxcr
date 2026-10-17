@@ -6,6 +6,13 @@
 //! by KeePassXC does not drop timestamps, tags, icons, auto-type settings,
 //! custom data, deleted objects or metadata settings.
 
+// This code parses untrusted files: a malformed one must give an error, never
+// a panic, so indexing and unwrap are not allowed here (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)
+)]
+
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 

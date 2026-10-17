@@ -100,8 +100,10 @@ pub enum Command {
 /// Common database credential arguments.
 #[derive(Debug, Args, Clone)]
 pub struct CredentialArgs {
-    /// Database password (unsafe; prefer prompt).
-    #[arg(long)]
+    /// Database password (unsafe; prefer prompt or stdin).
+    ///
+    /// Hidden from help: other local users can read it in the process list.
+    #[arg(long, hide = true)]
     pub password: Option<String>,
     /// Disable password prompt.
     #[arg(long)]
@@ -196,8 +198,10 @@ pub struct DbEditArgs {
     #[command(flatten)]
     pub credentials: CredentialArgs,
 
-    /// New password (unsafe; prefer prompt).
-    #[arg(long)]
+    /// New password (unsafe; prefer prompt or stdin).
+    ///
+    /// Hidden from help: other local users can read it in the process list.
+    #[arg(long, hide = true)]
     pub new_password: Option<String>,
     /// Disable prompt for new password.
     #[arg(long)]
@@ -221,8 +225,10 @@ pub struct MergeArgs {
     #[command(flatten)]
     pub credentials: CredentialArgs,
 
-    /// Source database password (unsafe; prefer prompt).
-    #[arg(long)]
+    /// Source database password (unsafe; prefer prompt or stdin).
+    ///
+    /// Hidden from help: other local users can read it in the process list.
+    #[arg(long, hide = true)]
     pub source_password: Option<String>,
     /// Source key file.
     #[arg(long, value_name = "FILE")]
@@ -463,7 +469,7 @@ pub struct ClipArgs {
     pub entry: String,
     /// Field to copy (title, username, password, url, notes, totp).
     pub field: String,
-    /// Auto-clear timeout in seconds.
+    /// Seconds before the clipboard is cleared (default 10, 0 to keep it).
     pub timeout: Option<u64>,
 
     #[command(flatten)]

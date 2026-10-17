@@ -24,7 +24,7 @@ All commands that open a database accept credential flags:
 
 Without `--password`, the password is prompted for, or read from stdin when stdin is not a
 terminal (`echo "$PW" | keepassxcr ls db.kdbx`). Prefer that over `--password`, which is visible
-to other users in the process list. `db-create` and `import` ask for the password twice.
+to other users in the process list, so `--help` no longer lists it. `db-create` and `import` ask for the password twice.
 `--yubikey` is accepted for compatibility but not supported yet.
 
 ### Create a database
@@ -123,13 +123,13 @@ for one command; `db-edit` always does, and locks the agent once the credentials
 | | `show` | Show an entry |
 | | `rm` | Remove an entry (moved to the recycle bin first, like KeePassXC) |
 | | `mv` | Move an entry to a group |
-| | `clip` | Copy a field to the clipboard |
+| | `clip` | Copy a field to the clipboard; cleared after 10 seconds unless a timeout is given (0 keeps it) |
 | | `search` | Search entries by term |
 | **Groups** | `ls` | List group contents |
 | | `mkdir` | Create a group |
 | | `rmdir` | Remove a group (moved to the recycle bin first, like KeePassXC) |
 | **Attachments** | `attachment-import` | Import an attachment |
-| | `attachment-export` | Export an attachment |
+| | `attachment-export` | Export an attachment; a new output file is readable by its owner only and an existing one is never replaced |
 | | `attachment-rm` | Remove an attachment |
 | **Utilities** | `generate` | Generate a random password |
 | | `diceware` | Generate a diceware passphrase |

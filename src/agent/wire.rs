@@ -9,6 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::agent::ExpiredMarker;
 use crate::crypto::{KdfConfig, sha256};
@@ -42,8 +43,9 @@ pub(super) struct Response {
     pub idle_left_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_left_secs: Option<u64>,
+    /// The transformed key in hex, wiped when dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transformed: Option<String>,
+    pub transformed: Option<Zeroizing<String>>,
 }
 
 /// Where one database's agent socket and expiry marker live.
@@ -134,14 +136,15 @@ pub(super) fn all_locations() -> AppResult<Vec<PathBuf>> {
 
 /// Write one JSON line.
 pub(super) fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> io::Result<()> {
-    let mut line = serde_json::to_vec(message)?;
+    // A response can carry the transformed key, so the buffer is wiped.
+    let mut line = Zeroizing::new(serde_json::to_vec(message)?);
     line.push(b'\n');
     stream.write_all(&line)
 }
 
 /// Read one JSON line, bounded by [`MAX_LINE`].
 pub(super) fn read_message<T: for<'de> Deserialize<'de>>(stream: &UnixStream) -> io::Result<T> {
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     BufReader::new(stream.take(MAX_LINE)).read_line(&mut line)?;
     if line.is_empty() {
         return Err(io::Error::new(

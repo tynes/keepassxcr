@@ -1596,6 +1596,25 @@ class TestAttachmentExport:
             assert r.exit_code == 0, f"{binary.name}: {r.stderr}"
             assert "test attachment content" in r.stdout
 
+    def test_export_keeps_file_private_and_existing_files_intact(
+        self, rust_binary, populated_db_with_attachment, tmp_path
+    ):
+        db_path, _ = populated_db_with_attachment
+        pw_args, pw_stdin = make_auth(rust_binary, TEST_PASSWORD)
+        output_file = tmp_path / "private.txt"
+        args = [
+            "attachment-export", str(db_path), "Entry1",
+            "test_attachment.txt", str(output_file),
+        ] + pw_args
+        r = run_cli(rust_binary, args, stdin_text=pw_stdin)
+        assert r.exit_code == 0, r.stderr
+        assert output_file.stat().st_mode & 0o777 == 0o600
+
+        output_file.write_text("keep me")
+        r = run_cli(rust_binary, args, stdin_text=pw_stdin)
+        assert r.exit_code != 0
+        assert output_file.read_text() == "keep me"
+
 
 class TestAttachmentRm:
     """Test attachment removal."""
