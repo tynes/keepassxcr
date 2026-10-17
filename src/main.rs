@@ -6,14 +6,18 @@ const EXIT_LOCKED: i32 = 3;
 
 fn main() -> anyhow::Result<()> {
     let result = keepassxcr::cli::run();
-    if let Err(err) = &result
-        && let Some(locked) = err
+    if let Err(err) = &result {
+        match err
             .chain()
             .find_map(|cause| cause.downcast_ref::<AppError>())
-            .filter(|cause| matches!(cause, AppError::Locked(_)))
-    {
-        eprintln!("keepassxcr: {locked}");
-        std::process::exit(EXIT_LOCKED);
+        {
+            Some(locked @ AppError::Locked(_)) => {
+                eprintln!("keepassxcr: {locked}");
+                std::process::exit(EXIT_LOCKED);
+            }
+            Some(AppError::Reported) => std::process::exit(1),
+            _ => {}
+        }
     }
     result.context("keepassxcr failed")
 }

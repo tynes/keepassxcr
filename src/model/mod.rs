@@ -1,3 +1,5 @@
+pub mod placeholders;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;

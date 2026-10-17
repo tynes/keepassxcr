@@ -24,7 +24,7 @@ use crate::cli::{
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
 use crate::format::{Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, write_kdbx};
-use crate::model::{Attachment, Database, Entry, Group};
+use crate::model::{Attachment, Database, Entry, Group, placeholders};
 use crate::xml::{BinaryPool, write_database};
 
 /// Dispatch CLI commands.
@@ -393,23 +393,40 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
 fn show_entry(args: EntryShowArgs) -> anyhow::Result<()> {
     let (file, _credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
-    let entry = file
-        .database
-        .entry_by_path(&group_path, title)
-        .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
+    let Some(entry) = file.database.entry_by_path(&group_path, title) else {
+        eprintln!("Could not find entry with path {}.", args.entry);
+        return Err(AppError::Reported.into());
+    };
 
     if !args.attributes.is_empty() {
-        let values = args
-            .attributes
-            .iter()
-            .map(|name| {
-                entry_attribute(entry, name).ok_or_else(|| {
-                    AppError::InvalidInput(format!("{} has no attribute {name}", args.entry))
-                })
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        for value in values {
-            println!("{value}");
+        // Like keepassxc-cli: print what resolves, report the rest on stderr
+        // and fail once every attribute has been tried.
+        let ctx = placeholders::Context {
+            root: file.database.root(),
+            database: &args.database,
+        };
+        let mut failed = false;
+        for name in &args.attributes {
+            match lookup_attribute(entry, name) {
+                Lookup::Field(value) => println!("{value}"),
+                Lookup::Attribute(value) => {
+                    println!("{}", placeholders::resolve(entry, &value, ctx));
+                }
+                Lookup::Unknown => {
+                    eprintln!("ERROR: unknown attribute {name}.");
+                    failed = true;
+                }
+                Lookup::Ambiguous(matches) => {
+                    eprintln!(
+                        "ERROR: attribute {name} is ambiguous, it matches {}.",
+                        matches.join(", ")
+                    );
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            return Err(AppError::Reported.into());
         }
         return Ok(());
     }
@@ -951,29 +968,71 @@ fn load_database(
     Ok((file, credentials))
 }
 
-/// Value of a standard attribute (case-insensitive, like keepassxc-cli) or a
-/// custom one (exact name first, then case-insensitive).
-fn entry_attribute(entry: &Entry, name: &str) -> Option<String> {
-    let value = match name.to_ascii_lowercase().as_str() {
-        "title" => entry.title(),
-        "username" => entry.username(),
-        "password" => entry.password().expose_secret(),
-        "url" => entry.url(),
-        "notes" => entry.notes(),
-        _ => {
-            let custom = entry.custom_fields();
-            return custom
-                .get(name)
-                .or_else(|| {
-                    custom
-                        .iter()
-                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                        .map(|(_, value)| value)
-                })
-                .cloned();
-        }
+/// Result of looking up an attribute name for `show -a`.
+#[derive(Debug, PartialEq, Eq)]
+enum Lookup {
+    /// `Uuid` or `Tags`, printed as is.
+    Field(String),
+    /// An attribute's raw value; placeholders are not resolved yet.
+    Attribute(String),
+    Unknown,
+    /// Several attributes match case-insensitively, sorted by name.
+    Ambiguous(Vec<String>),
+}
+
+/// Look up an attribute like keepassxc-cli: the `Uuid` and `Tags` fields by
+/// exact name, then an attribute by exact name, then case-insensitively.
+fn lookup_attribute(entry: &Entry, name: &str) -> Lookup {
+    match name {
+        "Uuid" => return Lookup::Field(format!("{{{}}}", entry.uuid().hyphenated())),
+        "Tags" => return Lookup::Field(entry_tags(entry)),
+        _ => {}
+    }
+    let mut attributes = placeholders::attributes(entry);
+    if let Some(value) = attributes.remove(name) {
+        return Lookup::Attribute(value);
+    }
+    let mut matches: Vec<(String, String)> = attributes
+        .into_iter()
+        .filter(|(key, _)| key.to_lowercase() == name.to_lowercase())
+        .collect();
+    match matches.len() {
+        0 => Lookup::Unknown,
+        1 => Lookup::Attribute(matches.remove(0).1),
+        _ => Lookup::Ambiguous(matches.into_iter().map(|(key, _)| key).collect()),
+    }
+}
+
+/// Tags as KeePassXC 2.7 shows them: split on `,`, `;` or tab, trimmed,
+/// deduplicated, sorted and joined with `,`.
+fn entry_tags(entry: &Entry) -> String {
+    let Some(raw) = entry.extra().iter().find(|raw| raw.name() == "Tags") else {
+        return String::new();
     };
-    Some(value.to_string())
+    let xml = raw.xml();
+    let text = xml
+        .find('>')
+        .and_then(|start| {
+            let end = xml.rfind("</")?;
+            (end > start).then(|| &xml[start + 1..end])
+        })
+        .unwrap_or_default();
+    let text =
+        quick_xml::escape::unescape(text).map_or_else(|_| text.to_string(), |t| t.into_owned());
+    let tags: std::collections::BTreeSet<&str> = text
+        .split([',', ';', '\t'])
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    tags.into_iter().collect::<Vec<_>>().join(",")
+}
+
+/// Raw value of an attribute for `clip`, matched like [`lookup_attribute`].
+fn entry_attribute(entry: &Entry, name: &str) -> Option<String> {
+    match lookup_attribute(entry, name) {
+        Lookup::Field(value) | Lookup::Attribute(value) => Some(value),
+        Lookup::Unknown | Lookup::Ambiguous(_) => None,
+    }
 }
 
 /// Split an entry path into group segments and entry title.

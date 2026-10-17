@@ -51,7 +51,8 @@ pub fn read_database(
     algo: ProtectedStreamAlgo,
 ) -> AppResult<Database> {
     let mut reader = Reader::from_reader(xml);
-    reader.trim_text(true);
+    // Values keep their leading and trailing whitespace, as in KeePassXC.
+    reader.trim_text(false);
     let mut parser = Parser {
         reader,
         input: xml,

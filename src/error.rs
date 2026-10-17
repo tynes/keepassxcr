@@ -30,6 +30,10 @@ pub enum AppError {
     /// The database's agent unlock expired; the command refuses to prompt.
     #[error("{0}")]
     Locked(String),
+
+    /// The command already printed its errors; exit with status 1 and print nothing more.
+    #[error("errors were reported above")]
+    Reported,
 }
 
 /// Result alias for keepassxcr operations.
