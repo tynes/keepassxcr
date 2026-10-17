@@ -6,7 +6,7 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-10-17
 
 Makes the crate easier to use as a library. The CLI behaves as before.
 
