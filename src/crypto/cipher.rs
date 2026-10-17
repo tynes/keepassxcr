@@ -123,7 +123,7 @@ where
     let mut buffer = plaintext.to_vec();
     let block_size = C::block_size();
     let pad_len = block_size - (buffer.len() % block_size);
-    buffer.extend(std::iter::repeat(0u8).take(pad_len));
+    buffer.extend(std::iter::repeat_n(0u8, pad_len));
     encryptor
         .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
         .map_err(|_| AppError::Crypto("padding error".to_string()))?;

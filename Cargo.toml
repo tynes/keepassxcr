@@ -1,6 +1,6 @@
 [package]
 name = "keepassxcr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A Rust reimplementation of keepassxc-cli, and a library for reading and writing KeePass KDBX 3.1/4.x databases"
@@ -22,12 +22,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "keepassxcr"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
-anyhow = "1.0"
+anyhow = { version = "1.0", optional = true }
 thiserror = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-rpassword = "7.3"
+clap = { version = "4.5", features = ["derive"], optional = true }
+rpassword = { version = "7.3", optional = true }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 rand = "0.8"
 sha1 = "0.10"
@@ -47,21 +48,25 @@ flate2 = "1.0"
 quick-xml = "0.42"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-indicatif = "0.17"
+indicatif = { version = "0.17", optional = true }
 secrecy = "0.8"
 # "serde" lets the agent protocol carry key material in wiped buffers.
 zeroize = { version = "1.7", features = ["serde"] }
 libc = "0.2"
-arboard = "3.4"
-zxcvbn = "2.2"
+arboard = { version = "3.4", optional = true }
+zxcvbn = { version = "2.2", optional = true }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 hex = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
 # YubiKey OTP interface: IOKit on macOS (opened shared), pure-Rust hidraw on Linux.
 hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev", "macos-shared-device"] }
 
 [features]
+default = ["cli"]
+# The `keepassxcr` binary and the `cli` module. Library users can turn it off
+# with `default-features = false` to skip the CLI's dependencies.
+cli = ["dep:anyhow", "dep:clap", "dep:rpassword", "dep:indicatif", "dep:arboard", "dep:zxcvbn", "dep:tracing-subscriber"]
 # Testing only: KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch] replaces the
 # USB YubiKey with an emulated one. Never enable this for a build you use.
 software-yubikey = []

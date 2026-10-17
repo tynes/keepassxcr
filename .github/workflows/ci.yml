@@ -26,6 +26,20 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked --features software-yubikey
 
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --features software-yubikey -- -D warnings
+      # The library alone, as a `default-features = false` dependency builds it.
+      - run: cargo clippy --locked --lib --no-default-features -- -D warnings
+      - run: cargo test --locked --lib --no-default-features
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest

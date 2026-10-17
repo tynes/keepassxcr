@@ -9,6 +9,7 @@ use crate::yubikey::YubiKeySlot;
 
 mod commands;
 mod interactive;
+mod progress;
 
 /// Run the keepassxcr CLI.
 pub fn run() -> anyhow::Result<()> {
@@ -17,6 +18,7 @@ pub fn run() -> anyhow::Result<()> {
     crate::agent::harden_process();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    progress::install();
     commands::dispatch(cli).context("command failed")
 }
 

@@ -9,7 +9,7 @@ writing KeePass databases.
 - Reads and writes **KDBX 3.1** and **KDBX 4.x** databases
 - CLI-compatible with `keepassxc-cli`
 - Pure Rust cryptography (no C bindings)
-- v0.1.0 — early development; keep a backup of any database you use it on
+- v0.2.0 — early development; keep a backup of any database you use it on
 
 ## Install
 
@@ -38,31 +38,29 @@ cargo install --path .     # or install it into ~/.cargo/bin
 ## Using it as a library
 
 ```sh
-cargo add keepassxcr
+cargo add keepassxcr --no-default-features
 ```
 
-The crate exposes the same code the CLI uses. `keepassxcr::format::read_kdbx` and `write_kdbx`
-open and save a database with a `Credentials` (password, key file, YubiKey slot), and
-`keepassxcr::model` holds the groups and entries:
+`--no-default-features` turns off the `cli` feature, which only the `keepassxcr` binary needs, so
+your build skips clap, the clipboard and the other CLI dependencies.
+
+`KdbxFile::open` and `save` read and write a database with `Credentials` (a password, key file
+and/or YubiKey slot), and `keepassxcr::model` holds the groups and entries:
 
 ```rust
-use keepassxcr::format::{Credentials, read_kdbx};
-use keepassxcr::secrecy::{ExposeSecret, SecretString};
+use keepassxcr::secrecy::ExposeSecret;
+use keepassxcr::{Credentials, KdbxFile};
 
-let credentials = Credentials {
-    password: Some(SecretString::new("correct horse battery staple".into())),
-    key_file: None,
-    yubikey: None,
-    agent: None,
-};
-let file = read_kdbx("passwords.kdbx".as_ref(), &credentials)?;
+let credentials = Credentials::password("correct horse battery staple");
+let file = KdbxFile::open("passwords.kdbx", &credentials)?;
 if let Some(entry) = file.database.entry_by_path(&["Email"], "Gmail") {
     println!("{}: {}", entry.username(), entry.password().expose_secret());
 }
 ```
 
-The [crate documentation](https://docs.rs/keepassxcr) has a full example that creates and saves a
-database. The library API is shaped by the CLI and may change between 0.x releases.
+For a key file or YubiKey, use `Credentials::builder()`. The
+[crate documentation](https://docs.rs/keepassxcr) has a full example that creates and saves a
+database. The library API may still change between 0.x releases.
 
 ## Usage
 
