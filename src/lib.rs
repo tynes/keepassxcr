@@ -48,7 +48,7 @@
 //!
 //! - `cli` (default): the `keepassxcr` binary. Library users can skip its
 //!   dependencies (clap, the clipboard, the progress bar, ...) with
-//!   `keepassxcr = { version = "0.2", default-features = false }`.
+//!   `keepassxcr = { version = "0.3", default-features = false }`.
 //!
 //! # Stability
 //!

@@ -9,7 +9,7 @@ writing KeePass databases.
 - Reads and writes **KDBX 3.1** and **KDBX 4.x** databases
 - CLI-compatible with `keepassxc-cli`
 - Pure Rust cryptography (no C bindings)
-- v0.2.0 — early development; keep a backup of any database you use it on
+- v0.3.0 — early development; keep a backup of any database you use it on
 
 ## Install
 

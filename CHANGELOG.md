@@ -6,6 +6,27 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
+Loads SSH keys stored in a database into ssh-agent, compatible with
+KeePassXC's SSH agent integration. keepassxc-cli has no equivalent.
+
+### Added
+
+- `ssh-add DB ENTRY...` loads an entry's SSH key into the agent at
+  `SSH_AUTH_SOCK`. `--all` loads what KeePassXC loads on unlock, `-l` lists
+  entries with keys and whether they are loaded, `-d` removes keys, and
+  `-t` / `-c` set a lifetime or ask before each use.
+- `ssh-key-import DB ENTRY KEYFILE` stores an OpenSSH private key in an entry
+  with KeePassXC-compatible `KeeAgent.settings`, after checking that the
+  entry's password opens it.
+- `unlock --ssh-add` loads the keys when the database is unlocked. While
+  unlocked, ssh-agent never keeps a key longer than the session has left, and
+  keys set to "remove on lock" are removed by `lock` and when the session
+  times out.
+- Ed25519, ECDSA, RSA and FIDO (`sk-`) keys in OpenSSH format. Older PEM keys
+  are refused with a hint to convert them with `ssh-keygen -p`.
+
 ## [0.2.0] - 2026-10-17
 
 Makes the crate easier to use as a library. The CLI behaves as before.
@@ -56,6 +77,7 @@ First release on crates.io.
 - The `keepassxcr` library crate, exposing the KDBX reader and writer and the
   database model.
 
-[Unreleased]: https://github.com/tynes/keepassxcr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tynes/keepassxcr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tynes/keepassxcr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tynes/keepassxcr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/tynes/keepassxcr/releases/tag/v0.1.0
