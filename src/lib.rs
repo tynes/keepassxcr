@@ -66,6 +66,8 @@ pub mod crypto;
 pub mod error;
 pub mod format;
 pub mod model;
+#[doc(hidden)]
+pub mod ssh;
 pub(crate) mod util;
 pub(crate) mod xml;
 pub mod yubikey;

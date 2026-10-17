@@ -209,6 +209,18 @@ pub(super) fn remember(key: &AgentKey, challenge: &[u8], response: &[u8; 32]) ->
     Ok(())
 }
 
+/// Have the agent remove an SSH key from the ssh-agent at `socket` when it locks.
+pub(super) fn track_ssh_key(key: &AgentKey, socket: &Path, public_blob: &[u8]) -> AppResult<()> {
+    ask(
+        key,
+        &Request::TrackSshKey {
+            socket: socket.to_path_buf(),
+            public_key: hex::encode(public_blob),
+        },
+    )?;
+    Ok(())
+}
+
 /// Send `request` to the agent behind `key` and check who answered.
 fn ask(key: &AgentKey, request: &Request) -> AppResult<Response> {
     let response = query(&key.socket, request).map_err(|err| {

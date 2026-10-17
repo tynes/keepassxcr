@@ -10,6 +10,7 @@ use crate::yubikey::YubiKeySlot;
 mod commands;
 mod interactive;
 mod progress;
+mod ssh;
 
 /// Run the keepassxcr CLI.
 pub fn run() -> anyhow::Result<()> {
@@ -81,6 +82,10 @@ pub enum Command {
     AttachmentRm(AttachmentRemoveArgs),
     /// Copy a field to the clipboard.
     Clip(ClipArgs),
+    /// Load SSH keys stored in entries into ssh-agent (KeePassXC's SSH agent settings).
+    SshAdd(SshAddArgs),
+    /// Store an SSH private key in an entry, set up for ssh-add and KeePassXC.
+    SshKeyImport(SshKeyImportArgs),
     /// Analyze passwords with offline HIBP data.
     Analyze(AnalyzeArgs),
     /// Estimate password strength.
@@ -148,6 +153,11 @@ pub struct UnlockArgs {
     /// Lock after this long no matter what (e.g. 8h, 1d).
     #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = crate::agent::parse_duration)]
     pub max: Duration,
+
+    /// Also load the SSH keys KeePassXC loads on unlock into ssh-agent
+    /// (entries set to "add key to agent when database is opened").
+    #[arg(long)]
+    pub ssh_add: bool,
 
     #[command(flatten)]
     pub credentials: CredentialArgs,
@@ -486,6 +496,67 @@ pub struct AttachmentRemoveArgs {
     pub entry: String,
     /// Attachment name.
     pub name: String,
+
+    #[command(flatten)]
+    pub credentials: CredentialArgs,
+}
+
+/// `ssh-add` arguments.
+#[derive(Debug, Args)]
+pub struct SshAddArgs {
+    /// Path to the database file.
+    pub database: PathBuf,
+    /// Entries holding SSH keys (Group/Entry).
+    #[arg(required_unless_present_any = ["all", "list"])]
+    pub entries: Vec<String>,
+
+    /// Every key KeePassXC loads on unlock; with --remove, every SSH key entry.
+    #[arg(short = 'a', long, conflicts_with = "entries")]
+    pub all: bool,
+    /// Remove the keys from ssh-agent instead.
+    #[arg(short = 'd', long, conflicts_with = "list")]
+    pub remove: bool,
+    /// List entries with SSH keys and whether ssh-agent has them.
+    #[arg(short = 'l', long, conflicts_with_all = ["entries", "all"])]
+    pub list: bool,
+    /// Have ssh-agent forget the keys after this long (e.g. 30m, 8h), instead
+    /// of the entry's setting. Never longer than an unlocked database's time left.
+    #[arg(short = 't', long, value_name = "DURATION", value_parser = crate::agent::parse_duration)]
+    pub lifetime: Option<Duration>,
+    /// Have ssh-agent ask before each use (needs ssh-askpass).
+    #[arg(short = 'c', long)]
+    pub confirm: bool,
+
+    #[command(flatten)]
+    pub credentials: CredentialArgs,
+}
+
+/// `ssh-key-import` arguments.
+#[derive(Debug, Args)]
+pub struct SshKeyImportArgs {
+    /// Path to the database file.
+    pub database: PathBuf,
+    /// Entry to store the key in (Group/Entry); its password must be the key's
+    /// passphrase, or empty for an unencrypted key.
+    pub entry: String,
+    /// OpenSSH private key file.
+    pub key: PathBuf,
+
+    /// Attachment name [default: the key file's name].
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+    /// Don't load the key when the database is unlocked with `unlock --ssh-add`.
+    #[arg(long)]
+    pub no_add_on_unlock: bool,
+    /// Keep the key in ssh-agent when the database locks.
+    #[arg(long)]
+    pub keep_on_lock: bool,
+    /// Have ssh-agent forget the key after this long (e.g. 1h).
+    #[arg(short = 't', long, value_name = "DURATION", value_parser = crate::agent::parse_duration)]
+    pub lifetime: Option<Duration>,
+    /// Have ssh-agent ask before each use (needs ssh-askpass).
+    #[arg(short = 'c', long)]
+    pub confirm: bool,
 
     #[command(flatten)]
     pub credentials: CredentialArgs,
