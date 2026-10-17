@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::crypto::{ProtectedStream, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
 use crate::model::{Attachment, Database, Entry, Group, RawElement};
+use zeroize::Zeroizing;
 
 /// Where the attachment pool is stored when writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,13 +32,41 @@ pub enum BinaryPool {
     Meta,
 }
 
+/// One attachment in a database's shared pool.
+#[derive(Clone)]
+pub struct PoolBinary {
+    /// Attachment bytes, wiped when dropped.
+    pub data: Zeroizing<Vec<u8>>,
+    /// The memory-protection flag (bit 0 of the KDBX 4 inner-header flag byte).
+    pub protected: bool,
+}
+
+impl PoolBinary {
+    /// Wrap attachment bytes with their protection flag.
+    pub fn new(data: Vec<u8>, protected: bool) -> Self {
+        Self {
+            data: Zeroizing::new(data),
+            protected,
+        }
+    }
+}
+
+impl std::fmt::Debug for PoolBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolBinary")
+            .field("len", &self.data.len())
+            .field("protected", &self.protected)
+            .finish()
+    }
+}
+
 /// XML output with attachment pool.
 #[derive(Debug, Clone)]
 pub struct XmlOutput {
     /// Serialized XML bytes.
     pub xml: Vec<u8>,
     /// Attachment pool in the order referenced by the XML.
-    pub attachments: Vec<Vec<u8>>,
+    pub attachments: Vec<PoolBinary>,
 }
 
 /// Parse a KeePass XML document into a database.
@@ -46,7 +75,7 @@ pub struct XmlOutput {
 /// empty slice and the pool is read from `Meta/Binaries`.
 pub fn read_database(
     xml: &[u8],
-    attachments: &[Vec<u8>],
+    attachments: &[PoolBinary],
     protected_stream_key: &[u8],
     algo: ProtectedStreamAlgo,
 ) -> AppResult<Database> {
@@ -101,6 +130,7 @@ pub fn write_database(
         stream: &mut stream,
         index: &index,
         protect_fields,
+        memory_protection: MemoryProtection::of(database),
     };
     start(&mut writer, BytesStart::new("Root"))?;
     write_group(&mut writer, database.root(), &mut ctx)?;
@@ -131,12 +161,12 @@ struct Parser<'a> {
     input: &'a str,
     stream: ProtectedStream,
     /// KDBX4 inner-header attachment pool, indexed by position.
-    binaries: Vec<Vec<u8>>,
+    binaries: Vec<PoolBinary>,
     /// KDBX3 `Meta/Binaries` pool, keyed by the `ID` attribute.
     ///
     /// A map rather than a vector so that a huge `ID` from the file cannot
     /// cause a huge allocation.
-    meta_binaries: HashMap<usize, Vec<u8>>,
+    meta_binaries: HashMap<usize, PoolBinary>,
     /// Current `Group`/`Entry` nesting depth.
     depth: usize,
 }
@@ -323,7 +353,8 @@ impl<'a> Parser<'a> {
                 .parse::<usize>()
                 .map_err(|_| AppError::Xml("invalid binary ID".to_string()))?;
             let mut bytes = decode_base64(&data, "binary")?;
-            if attr(&attributes, "Protected").as_deref() == Some("True") {
+            let protected = attr(&attributes, "Protected").as_deref() == Some("True");
+            if protected {
                 self.stream.apply(&mut bytes)?;
             }
             // KeePassXC writes an empty attachment as `<Binary ID="n" Compressed="True"/>`
@@ -331,7 +362,8 @@ impl<'a> Parser<'a> {
             if attr(&attributes, "Compressed").as_deref() == Some("True") && !bytes.is_empty() {
                 bytes = gunzip_limited(&bytes)?;
             }
-            self.meta_binaries.insert(id, bytes);
+            self.meta_binaries
+                .insert(id, PoolBinary::new(bytes, protected));
         }
         Ok(())
     }
@@ -431,6 +463,7 @@ impl<'a> Parser<'a> {
                     "UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
                     "String" => {
                         let (key, value, protected) = self.parse_string()?;
+                        entry.set_protected(&key, protected);
                         match key.as_str() {
                             "Title" => entry.set_title(value),
                             "UserName" => entry.set_username(value),
@@ -544,10 +577,12 @@ impl<'a> Parser<'a> {
                         let raw = self.read_text()?;
                         if !raw.is_empty() {
                             let mut bytes = decode_base64(&raw, "attachment")?;
-                            if attr(&attributes, "Protected").as_deref() == Some("True") {
+                            let protected =
+                                attr(&attributes, "Protected").as_deref() == Some("True");
+                            if protected {
                                 self.stream.apply(&mut bytes)?;
                             }
-                            value = Some(bytes);
+                            value = Some(PoolBinary::new(bytes, protected));
                         }
                         attributes
                     }
@@ -574,17 +609,21 @@ impl<'a> Parser<'a> {
             Some(value) => value,
             None => return Ok(None),
         };
-        let data = match (ref_index, value) {
+        let binary = match (ref_index, value) {
             (Some(index), _) => self
                 .binaries
                 .get(index)
                 .or_else(|| self.meta_binaries.get(&index))
                 .cloned()
                 .ok_or_else(|| AppError::Xml("attachment ref out of bounds".to_string()))?,
-            (None, Some(data)) => data,
-            (None, None) => Vec::new(),
+            (None, Some(binary)) => binary,
+            (None, None) => PoolBinary::new(Vec::new(), true),
         };
-        Ok(Some(Attachment::new(name, data)))
+        Ok(Some(Attachment::with_protection(
+            name,
+            binary.data.to_vec(),
+            binary.protected,
+        )))
     }
 }
 
@@ -636,24 +675,81 @@ fn parse_uuid(text: &str) -> AppResult<Uuid> {
 
 struct WriteContext<'a> {
     stream: &'a mut ProtectedStream,
-    index: &'a HashMap<Vec<u8>, usize>,
+    index: &'a PoolIndex,
     protect_fields: bool,
+    memory_protection: MemoryProtection,
+}
+
+/// Pool position of each distinct (data, protection flag) pair.
+type PoolIndex = HashMap<(Vec<u8>, bool), usize>;
+
+fn pool_key(attachment: &Attachment) -> (Vec<u8>, bool) {
+    (attachment.data().to_vec(), attachment.protected())
+}
+
+/// The database's `Meta/MemoryProtection` settings: which standard fields
+/// are always written protected, whatever each entry says.
+#[derive(Debug, Clone, Copy)]
+struct MemoryProtection {
+    title: bool,
+    username: bool,
+    password: bool,
+    url: bool,
+    notes: bool,
+}
+
+impl MemoryProtection {
+    /// Read the settings, using KeePassXC's defaults (only the password) for
+    /// anything missing.
+    fn of(database: &Database) -> Self {
+        let raw = database
+            .meta()
+            .extra()
+            .iter()
+            .find(|raw| raw.name() == "MemoryProtection");
+        let flag = |tag: &str, default: bool| {
+            raw.and_then(|raw| crate::model::element_text(raw.xml(), tag))
+                .map_or(default, |text| text.trim().eq_ignore_ascii_case("true"))
+        };
+        Self {
+            title: flag("ProtectTitle", false),
+            username: flag("ProtectUserName", false),
+            password: flag("ProtectPassword", true),
+            url: flag("ProtectURL", false),
+            notes: flag("ProtectNotes", false),
+        }
+    }
+
+    fn covers(self, key: &str) -> bool {
+        match key {
+            "Title" => self.title,
+            "UserName" => self.username,
+            "Password" => self.password,
+            "URL" => self.url,
+            "Notes" => self.notes,
+            _ => false,
+        }
+    }
 }
 
 /// Collect every attachment (including those in history) into a deduplicated pool.
-fn build_attachment_pool(root: &Group) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, usize>) {
-    fn visit_entry(entry: &Entry, pool: &mut Vec<Vec<u8>>, index: &mut HashMap<Vec<u8>, usize>) {
+fn build_attachment_pool(root: &Group) -> (Vec<PoolBinary>, PoolIndex) {
+    fn visit_entry(entry: &Entry, pool: &mut Vec<PoolBinary>, index: &mut PoolIndex) {
         for attachment in entry.attachments() {
-            if !index.contains_key(attachment.data()) {
-                index.insert(attachment.data().to_vec(), pool.len());
-                pool.push(attachment.data().to_vec());
+            let key = pool_key(attachment);
+            if !index.contains_key(&key) {
+                index.insert(key, pool.len());
+                pool.push(PoolBinary::new(
+                    attachment.data().to_vec(),
+                    attachment.protected(),
+                ));
             }
         }
         for item in entry.history() {
             visit_entry(item, pool, index);
         }
     }
-    fn visit_group(group: &Group, pool: &mut Vec<Vec<u8>>, index: &mut HashMap<Vec<u8>, usize>) {
+    fn visit_group(group: &Group, pool: &mut Vec<PoolBinary>, index: &mut PoolIndex) {
         for entry in group.entries() {
             visit_entry(entry, pool, index);
         }
@@ -698,7 +794,7 @@ fn write_raw<W: std::io::Write>(writer: &mut Writer<W>, elements: &[RawElement])
 fn write_meta<W: std::io::Write>(
     writer: &mut Writer<W>,
     database: &Database,
-    binaries: &[Vec<u8>],
+    binaries: &[PoolBinary],
 ) -> AppResult<()> {
     start(writer, BytesStart::new("Meta"))?;
     write_simple_element(writer, "Generator", "keepassxcr")?;
@@ -708,10 +804,10 @@ fn write_meta<W: std::io::Write>(
 
     if !binaries.is_empty() {
         start(writer, BytesStart::new("Binaries"))?;
-        for (id, data) in binaries.iter().enumerate() {
+        for (id, binary) in binaries.iter().enumerate() {
             let mut element = BytesStart::new("Binary");
             element.push_attribute(("ID", id.to_string().as_str()));
-            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&binary.data[..]);
             write_text_element(writer, "Binary", element, &encoded)?;
         }
         end(writer, "Binaries")?;
@@ -769,26 +865,28 @@ fn write_entry<W: std::io::Write>(
         }
     }
 
-    write_string(writer, "Title", entry.title(), false, ctx)?;
-    write_string(writer, "UserName", entry.username(), false, ctx)?;
-    write_string(
-        writer,
-        "Password",
-        entry.password().expose_secret(),
-        true,
-        ctx,
-    )?;
-    write_string(writer, "URL", entry.url(), false, ctx)?;
-    write_string(writer, "Notes", entry.notes(), false, ctx)?;
-    for (key, value) in entry.custom_fields() {
-        let protected = entry.protected_fields().contains(key);
+    // Like KeePassXC: a field is protected if the entry says so or the
+    // database's memory-protection settings cover it.
+    let standard = [
+        ("Title", entry.title()),
+        ("UserName", entry.username()),
+        ("Password", entry.password().expose_secret()),
+        ("URL", entry.url()),
+        ("Notes", entry.notes()),
+    ];
+    let custom = entry
+        .custom_fields()
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    for (key, value) in standard.into_iter().chain(custom) {
+        let protected = entry.protected_fields().contains(key) || ctx.memory_protection.covers(key);
         write_string(writer, key, value, protected, ctx)?;
     }
 
     for attachment in entry.attachments() {
         let index = ctx
             .index
-            .get(attachment.data())
+            .get(&pool_key(attachment))
             .copied()
             .ok_or_else(|| AppError::Xml("attachment missing from pool".to_string()))?;
         write_attachment_ref(writer, attachment.name(), index)?;
@@ -1045,7 +1143,10 @@ mod tests {
         let entry = &parsed.root().entries()[0];
         assert_eq!(entry.url(), "");
         assert_eq!(
-            entry.custom_fields().get("Empty").map(String::as_str),
+            entry
+                .custom_fields()
+                .get("Empty")
+                .map(|value| value.as_str()),
             Some("")
         );
     }
@@ -1106,6 +1207,73 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(db.root().name(), "a & b <c> AB");
+    }
+
+    fn written(db: &Database) -> String {
+        let output = write_database(
+            db,
+            &KEY,
+            ProtectedStreamAlgo::Salsa20,
+            true,
+            BinaryPool::InnerHeader,
+        )
+        .expect("write");
+        String::from_utf8(output.xml).expect("utf8")
+    }
+
+    #[test]
+    fn protection_flags_survive_a_save() {
+        // Notes protected per entry; the password left unprotected on purpose.
+        let mut stream = ProtectedStream::new(ProtectedStreamAlgo::Salsa20, &KEY).expect("stream");
+        let mut secret = b"secret notes".to_vec();
+        stream.apply(&mut secret).expect("encrypt");
+        let notes = base64::engine::general_purpose::STANDARD.encode(secret);
+        let xml = format!(
+            "<KeePassFile><Meta><MemoryProtection><ProtectPassword>False</ProtectPassword>\
+             </MemoryProtection></Meta><Root><Group><Name>R</Name><Entry>\
+             <String><Key>Title</Key><Value>T</Value></String>\
+             <String><Key>Notes</Key><Value Protected=\"True\">{notes}</Value></String>\
+             <String><Key>Password</Key><Value>plain</Value></String>\
+             </Entry></Group></Root></KeePassFile>"
+        );
+        let db = parse(&xml).expect("parse");
+        let entry = &db.root().entries()[0];
+        assert_eq!(entry.notes(), "secret notes");
+        assert!(entry.protected_fields().contains("Notes"));
+        assert!(!entry.protected_fields().contains("Password"));
+
+        let text = written(&db);
+        assert!(!text.contains("secret notes"), "{text}");
+        assert!(text.contains("<Value>plain</Value>"), "{text}");
+        let reread = parse(&text).expect("reread");
+        assert_eq!(reread.root().entries()[0].notes(), "secret notes");
+    }
+
+    #[test]
+    fn memory_protection_settings_apply_to_every_entry() {
+        let mut db = parse(
+            "<KeePassFile><Meta><MemoryProtection><ProtectTitle>True</ProtectTitle>\
+             </MemoryProtection></Meta><Root><Group><Name>R</Name></Group></Root></KeePassFile>",
+        )
+        .expect("parse");
+        let mut entry = Entry::new("hidden title".to_string());
+        entry.set_password(SecretString::new("hidden password".to_string()));
+        db.root_mut().entries_mut().push(entry);
+        let text = written(&db);
+        assert!(!text.contains("hidden title"), "{text}");
+        assert!(!text.contains("hidden password"), "{text}");
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let mut entry = Entry::new("Title".to_string());
+        entry.set_password(SecretString::new("hunter2".to_string()));
+        entry.set_custom_field("Token".to_string(), "abc123".to_string(), true);
+        let debug = format!("{entry:?}");
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("abc123"),
+            "{debug}"
+        );
     }
 
     #[test]

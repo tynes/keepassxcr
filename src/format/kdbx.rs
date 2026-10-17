@@ -26,10 +26,10 @@ use crate::format::types::{Compression, KdbxVersion};
 use crate::format::variant_map::{VariantValue, read_variant_map, write_variant_map};
 use crate::model::Database;
 use crate::util::{read_u16_le, read_u32_le, read_u64_le, read_vec, write_u16_le, write_u32_le};
-use crate::xml::{BinaryPool, read_database, write_database};
+use crate::xml::{BinaryPool, PoolBinary, read_database, write_database};
 
 /// Credentials for database operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     /// Optional password.
     pub password: Option<SecretString>,
@@ -37,6 +37,17 @@ pub struct Credentials {
     pub key_file: Option<KeyFile>,
     /// Unlocked agent holding the composite key, used instead of the fields above.
     pub agent: Option<AgentKey>,
+}
+
+impl std::fmt::Debug for Credentials {
+    /// Shows which credentials are present, never their values.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("password", &self.password.is_some())
+            .field("key_file", &self.key_file.is_some())
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -379,7 +390,7 @@ fn build_final_key(
 
 struct PayloadData {
     xml: Vec<u8>,
-    attachments: Vec<Vec<u8>>,
+    attachments: Vec<PoolBinary>,
     protected_stream: ProtectedStreamAlgo,
     protected_stream_key: Vec<u8>,
 }
@@ -465,7 +476,7 @@ fn read_kdbx4_payload(
 struct InnerHeader {
     protected_stream: ProtectedStreamAlgo,
     protected_stream_key: Vec<u8>,
-    binaries: Vec<Vec<u8>>,
+    binaries: Vec<PoolBinary>,
 }
 
 fn split_inner_header(payload: &[u8]) -> AppResult<(InnerHeader, Vec<u8>)> {
@@ -498,10 +509,10 @@ fn split_inner_header(payload: &[u8]) -> AppResult<(InnerHeader, Vec<u8>)> {
                 protected_stream_key = Some(data);
             }
             x if x == InnerHeaderFieldId::Binary as u8 => {
-                if data.is_empty() {
-                    return Err(AppError::Format("invalid inner binary".to_string()));
-                }
-                binaries.push(data[1..].to_vec());
+                let (flags, content) = data
+                    .split_first()
+                    .ok_or_else(|| AppError::Format("invalid inner binary".to_string()))?;
+                binaries.push(PoolBinary::new(content.to_vec(), flags & 0x01 != 0));
             }
             _ => {}
         }
@@ -680,9 +691,9 @@ fn write_kdbx4(
         &protected_stream_key,
     )?;
     for binary in &attachments {
-        let mut data = Vec::with_capacity(binary.len() + 1);
-        data.push(0x01);
-        data.extend_from_slice(binary);
+        let mut data = zeroize::Zeroizing::new(Vec::with_capacity(binary.data.len() + 1));
+        data.push(u8::from(binary.protected));
+        data.extend_from_slice(&binary.data);
         write_inner_header_field(&mut inner_header, InnerHeaderFieldId::Binary, &data)?;
     }
     write_inner_header_field(&mut inner_header, InnerHeaderFieldId::End, &[])?;
@@ -905,6 +916,39 @@ mod tests {
         let leftovers = fs::read_dir(&dir).expect("list").count();
         assert_eq!(leftovers, 1, "temporary file left behind");
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn attachment_protection_flag_survives_a_save() {
+        let (mut file, credentials) = test_file();
+        let mut entry = crate::model::Entry::new("E".to_string());
+        entry
+            .attachments_mut()
+            .push(crate::model::Attachment::with_protection(
+                "plain.txt".to_string(),
+                b"plain".to_vec(),
+                false,
+            ));
+        entry.attachments_mut().push(crate::model::Attachment::new(
+            "secret.txt".to_string(),
+            b"s".to_vec(),
+        ));
+        file.database.root_mut().entries_mut().push(entry);
+        let bytes = write_kdbx_bytes(&file, &credentials).expect("write");
+        let read = read_kdbx_bytes(&bytes, &credentials).expect("read");
+        let flags: Vec<bool> = read.database.root().entries()[0]
+            .attachments()
+            .iter()
+            .map(crate::model::Attachment::protected)
+            .collect();
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    #[test]
+    fn credentials_debug_hides_the_password() {
+        let (_, credentials) = test_file();
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("pw\""), "{debug}");
     }
 
     #[test]

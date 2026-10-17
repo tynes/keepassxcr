@@ -5,20 +5,28 @@ use base64::Engine as _;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
+use zeroize::Zeroizing;
+
 use crate::crypto::hash::sha256;
 use crate::error::{AppError, AppResult};
 
-/// Parsed key file data.
-#[derive(Debug, Clone)]
+/// Parsed key file data, wiped when dropped.
+#[derive(Clone)]
 pub struct KeyFile {
-    raw_key: Vec<u8>,
+    raw_key: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for KeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyFile").finish_non_exhaustive()
+    }
 }
 
 impl KeyFile {
     /// Load a key file from disk.
     pub fn load(path: &Path) -> AppResult<Self> {
-        let data = fs::read(path)?;
-        let raw_key = parse_keyfile(&data)?;
+        let data = Zeroizing::new(fs::read(path)?);
+        let raw_key = Zeroizing::new(parse_keyfile(&data)?);
         Ok(Self { raw_key })
     }
 

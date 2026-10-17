@@ -608,7 +608,7 @@ fn clip(args: ClipArgs) -> anyhow::Result<()> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
     clipboard
-        .set_text(value.clone())
+        .set_text(value.as_str())
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
 
     if let Some(timeout) = args.timeout {
@@ -714,7 +714,7 @@ fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
     }
     // Fail on a wrong password now, not on the first command that uses the agent.
     read_kdbx(&args.database, &credentials)?;
-    let raw_key = Zeroizing::new(credentials.composite_key()?.raw_key());
+    let raw_key = credentials.composite_key()?.raw_key();
     let status = agent::unlock(&args.database, &raw_key, args.idle, args.max)?;
     println!("Unlocked {}", describe_unlocked(&status));
     Ok(())
@@ -974,7 +974,7 @@ enum Lookup {
     /// `Uuid` or `Tags`, printed as is.
     Field(String),
     /// An attribute's raw value; placeholders are not resolved yet.
-    Attribute(String),
+    Attribute(Zeroizing<String>),
     Unknown,
     /// Several attributes match case-insensitively, sorted by name.
     Ambiguous(Vec<String>),
@@ -992,7 +992,7 @@ fn lookup_attribute(entry: &Entry, name: &str) -> Lookup {
     if let Some(value) = attributes.remove(name) {
         return Lookup::Attribute(value);
     }
-    let mut matches: Vec<(String, String)> = attributes
+    let mut matches: Vec<(String, Zeroizing<String>)> = attributes
         .into_iter()
         .filter(|(key, _)| key.to_lowercase() == name.to_lowercase())
         .collect();
@@ -1028,9 +1028,10 @@ fn entry_tags(entry: &Entry) -> String {
 }
 
 /// Raw value of an attribute for `clip`, matched like [`lookup_attribute`].
-fn entry_attribute(entry: &Entry, name: &str) -> Option<String> {
+fn entry_attribute(entry: &Entry, name: &str) -> Option<Zeroizing<String>> {
     match lookup_attribute(entry, name) {
-        Lookup::Field(value) | Lookup::Attribute(value) => Some(value),
+        Lookup::Field(value) => Some(Zeroizing::new(value)),
+        Lookup::Attribute(value) => Some(value),
         Lookup::Unknown | Lookup::Ambiguous(_) => None,
     }
 }
@@ -1306,19 +1307,27 @@ mod tests {
         entry.set_password(SecretString::new("pw\nsecond line".to_string()));
         entry.set_custom_field("RPC_URL".to_string(), "http://x".to_string(), false);
         assert_eq!(
-            entry_attribute(&entry, "UserName").as_deref(),
+            entry_attribute(&entry, "UserName")
+                .as_deref()
+                .map(String::as_str),
             Some("alice")
         );
         assert_eq!(
-            entry_attribute(&entry, "password").as_deref(),
+            entry_attribute(&entry, "password")
+                .as_deref()
+                .map(String::as_str),
             Some("pw\nsecond line")
         );
         assert_eq!(
-            entry_attribute(&entry, "RPC_URL").as_deref(),
+            entry_attribute(&entry, "RPC_URL")
+                .as_deref()
+                .map(String::as_str),
             Some("http://x")
         );
         assert_eq!(
-            entry_attribute(&entry, "rpc_url").as_deref(),
+            entry_attribute(&entry, "rpc_url")
+                .as_deref()
+                .map(String::as_str),
             Some("http://x")
         );
         assert_eq!(entry_attribute(&entry, "missing"), None);

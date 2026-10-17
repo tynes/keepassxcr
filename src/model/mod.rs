@@ -6,6 +6,7 @@ use base64::Engine as _;
 use secrecy::SecretString;
 use time::OffsetDateTime;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Maximum number of history items kept per entry (the KeePassXC default).
 pub const HISTORY_MAX_ITEMS: usize = 10;
@@ -32,7 +33,7 @@ pub fn parse_kdbx_time(text: &str) -> Option<i64> {
 }
 
 /// Return the text of the first `<tag>…</tag>` inside an XML snippet.
-fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -68,17 +69,43 @@ impl RawElement {
     }
 }
 
-/// Attachment data stored with an entry.
-#[derive(Debug, Clone)]
+/// Attachment data stored with an entry. The bytes are wiped when dropped.
+#[derive(Clone)]
 pub struct Attachment {
     name: String,
-    data: Vec<u8>,
+    data: Zeroizing<Vec<u8>>,
+    protected: bool,
+}
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attachment")
+            .field("name", &self.name)
+            .field("len", &self.data.len())
+            .field("protected", &self.protected)
+            .finish()
+    }
 }
 
 impl Attachment {
-    /// Create a new attachment.
+    /// Create a new attachment, protected in memory like KeePassXC's.
     pub fn new(name: String, data: Vec<u8>) -> Self {
-        Self { name, data }
+        Self::with_protection(name, data, true)
+    }
+
+    /// Create an attachment with an explicit memory-protection flag (the
+    /// flag byte of a KDBX 4 inner-header binary, or `Protected` in KDBX 3.1).
+    pub fn with_protection(name: String, data: Vec<u8>, protected: bool) -> Self {
+        Self {
+            name,
+            data: Zeroizing::new(data),
+            protected,
+        }
+    }
+
+    /// Whether the attachment is marked for in-memory protection.
+    pub fn protected(&self) -> bool {
+        self.protected
     }
 
     /// Attachment name.
@@ -107,16 +134,16 @@ pub enum EntryField {
     Notes,
 }
 
-/// A database entry.
-#[derive(Debug, Clone)]
+/// A database entry. Field values are wiped from memory when dropped.
+#[derive(Clone)]
 pub struct Entry {
     uuid: Uuid,
-    title: String,
-    username: String,
+    title: Zeroizing<String>,
+    username: Zeroizing<String>,
     password: SecretString,
-    url: String,
-    notes: String,
-    custom_fields: BTreeMap<String, String>,
+    url: Zeroizing<String>,
+    notes: Zeroizing<String>,
+    custom_fields: BTreeMap<String, Zeroizing<String>>,
     protected_fields: BTreeSet<String>,
     attachments: Vec<Attachment>,
     extra: Vec<RawElement>,
@@ -124,18 +151,33 @@ pub struct Entry {
     modified: Option<OffsetDateTime>,
 }
 
+impl std::fmt::Debug for Entry {
+    /// Shows the structure only: field values may be secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("uuid", &self.uuid)
+            .field(
+                "custom_fields",
+                &self.custom_fields.keys().collect::<Vec<_>>(),
+            )
+            .field("attachments", &self.attachments)
+            .field("history", &self.history.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Entry {
     /// Create a new entry with default fields.
     pub fn new(title: String) -> Self {
         Self {
             uuid: Uuid::new_v4(),
-            title,
-            username: String::new(),
+            title: Zeroizing::new(title),
+            username: Zeroizing::default(),
             password: SecretString::new(String::new()),
-            url: String::new(),
-            notes: String::new(),
+            url: Zeroizing::default(),
+            notes: Zeroizing::default(),
             custom_fields: BTreeMap::new(),
-            protected_fields: BTreeSet::new(),
+            protected_fields: BTreeSet::from(["Password".to_string()]),
             attachments: Vec::new(),
             extra: Vec::new(),
             history: Vec::new(),
@@ -168,7 +210,7 @@ impl Entry {
 
     /// Update entry title.
     pub fn set_title(&mut self, title: String) {
-        self.title = title;
+        self.title = Zeroizing::new(title);
     }
 
     /// Entry username.
@@ -178,7 +220,7 @@ impl Entry {
 
     /// Update entry username.
     pub fn set_username(&mut self, username: String) {
-        self.username = username;
+        self.username = Zeroizing::new(username);
     }
 
     /// Entry password.
@@ -189,7 +231,6 @@ impl Entry {
     /// Update entry password.
     pub fn set_password(&mut self, password: SecretString) {
         self.password = password;
-        self.protected_fields.insert("Password".to_string());
     }
 
     /// Entry URL.
@@ -199,7 +240,7 @@ impl Entry {
 
     /// Update entry URL.
     pub fn set_url(&mut self, url: String) {
-        self.url = url;
+        self.url = Zeroizing::new(url);
     }
 
     /// Entry notes.
@@ -209,25 +250,33 @@ impl Entry {
 
     /// Update entry notes.
     pub fn set_notes(&mut self, notes: String) {
-        self.notes = notes;
+        self.notes = Zeroizing::new(notes);
     }
 
     /// Set a custom field value.
     pub fn set_custom_field(&mut self, key: String, value: String, protected: bool) {
-        self.custom_fields.insert(key.clone(), value);
-        if protected {
-            self.protected_fields.insert(key);
-        }
+        self.set_protected(&key, protected);
+        self.custom_fields.insert(key, Zeroizing::new(value));
     }
 
     /// Return custom fields.
-    pub fn custom_fields(&self) -> &BTreeMap<String, String> {
+    pub fn custom_fields(&self) -> &BTreeMap<String, Zeroizing<String>> {
         &self.custom_fields
     }
 
-    /// Return the set of protected field names.
+    /// Names of the fields (standard or custom) marked for in-memory
+    /// protection. They are written encrypted with the inner stream.
     pub fn protected_fields(&self) -> &BTreeSet<String> {
         &self.protected_fields
+    }
+
+    /// Mark a field (standard or custom) as protected or not.
+    pub fn set_protected(&mut self, key: &str, protected: bool) {
+        if protected {
+            self.protected_fields.insert(key.to_string());
+        } else {
+            self.protected_fields.remove(key);
+        }
     }
 
     /// Entry attachments.
@@ -594,7 +643,10 @@ mod tests {
         assert_eq!(entry.username(), "user");
         assert_eq!(entry.url(), "https://example.com");
         assert_eq!(entry.notes(), "notes");
-        assert_eq!(entry.custom_fields().get("key"), Some(&"value".to_string()));
+        assert_eq!(
+            entry.custom_fields().get("key").map(|value| value.as_str()),
+            Some("value")
+        );
         assert!(entry.protected_fields().contains("key"));
     }
 
