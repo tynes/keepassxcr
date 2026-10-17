@@ -15,6 +15,6 @@ pub use constants::{
     KDF_AES_KDBX3, KDF_AES_KDBX4, KDF_ARGON2D, KDF_ARGON2ID,
 };
 pub use hash::{hmac_sha256, kdbx_hmac_key, sha256, sha512};
-pub use kdf::{KdfConfig, KdfType};
+pub use kdf::{KdfConfig, KdfProgressHook, KdfType, set_kdf_progress_hook};
 pub use keyfile::KeyFile;
 pub use protected_stream::{ProtectedStream, ProtectedStreamAlgo};

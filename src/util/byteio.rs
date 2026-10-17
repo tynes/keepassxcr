@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 /// Read a u16 in little-endian order.
 pub fn read_u16_le<R: Read>(reader: &mut R) -> AppResult<u16> {
@@ -35,12 +35,6 @@ pub fn write_u32_le<W: Write>(writer: &mut W, value: u32) -> AppResult<()> {
     Ok(())
 }
 
-/// Write a u64 in little-endian order.
-pub fn write_u64_le<W: Write>(writer: &mut W, value: u64) -> AppResult<()> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
 /// Read an exact number of bytes into a vector.
 ///
 /// `len` usually comes from the file, so the buffer grows as data actually
@@ -63,19 +57,6 @@ pub fn read_array<const N: usize, R: Read>(reader: &mut R) -> AppResult<[u8; N]>
     Ok(buf)
 }
 
-/// Convert a slice to a fixed-size array.
-pub fn to_array<const N: usize>(data: &[u8]) -> AppResult<[u8; N]> {
-    if data.len() != N {
-        return Err(AppError::Format(format!(
-            "expected {N} bytes, got {}",
-            data.len()
-        )));
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(data);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,11 +68,5 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let value = read_u32_le(&mut cursor).expect("read");
         assert_eq!(value, 0xAABBCCDD);
-    }
-
-    #[test]
-    fn to_array_ok() {
-        let arr = to_array::<4>(&[1, 2, 3, 4]).expect("array");
-        assert_eq!(arr, [1, 2, 3, 4]);
     }
 }

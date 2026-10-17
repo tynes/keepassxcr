@@ -966,8 +966,8 @@ fn build_attachment_pool(root: &Group) -> (Vec<PoolBinary>, PoolIndex) {
     fn visit_entry(entry: &Entry, pool: &mut Vec<PoolBinary>, index: &mut PoolIndex) {
         for attachment in entry.attachments() {
             let key = pool_key(attachment);
-            if !index.contains_key(&key) {
-                index.insert(key, pool.len());
+            if let std::collections::hash_map::Entry::Vacant(slot) = index.entry(key) {
+                slot.insert(pool.len());
                 pool.push(PoolBinary::new(
                     attachment.data().to_vec(),
                     attachment.protected(),

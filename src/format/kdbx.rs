@@ -55,6 +55,59 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// Credentials made of a password alone.
+    pub fn password(password: impl Into<String>) -> Self {
+        Self::builder().password(password).build()
+    }
+
+    /// Start building credentials from a password, key file and YubiKey.
+    pub fn builder() -> CredentialsBuilder {
+        CredentialsBuilder::default()
+    }
+}
+
+/// Builds [`Credentials`]; start with [`Credentials::builder`].
+///
+/// Any combination of a password, a key file and a YubiKey is a valid key, as
+/// in KeePassXC, as long as at least one is given.
+#[derive(Debug, Default)]
+pub struct CredentialsBuilder {
+    password: Option<SecretString>,
+    key_file: Option<KeyFile>,
+    yubikey: Option<YubiKeySlot>,
+}
+
+impl CredentialsBuilder {
+    /// Use this password.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(SecretString::new(password.into()));
+        self
+    }
+
+    /// Use this key file, loaded with [`KeyFile::load`].
+    pub fn key_file(mut self, key_file: KeyFile) -> Self {
+        self.key_file = Some(key_file);
+        self
+    }
+
+    /// Use a YubiKey's HMAC-SHA1 challenge-response slot.
+    pub fn yubikey(mut self, slot: YubiKeySlot) -> Self {
+        self.yubikey = Some(slot);
+        self
+    }
+
+    /// The finished credentials.
+    pub fn build(self) -> Credentials {
+        Credentials {
+            password: self.password,
+            key_file: self.key_file,
+            yubikey: self.yubikey,
+            agent: None,
+        }
+    }
+}
+
+impl Credentials {
     /// Build a composite key from the password and key file.
     pub fn composite_key(&self) -> AppResult<CompositeKey> {
         let mut composite = CompositeKey::new();
@@ -200,6 +253,34 @@ pub struct KdbxFile {
     pub protected_stream: ProtectedStreamAlgo,
     /// Database content.
     pub database: Database,
+}
+
+impl KdbxFile {
+    /// A new file holding `database`, with the same settings as
+    /// `keepassxcr db-create`: KDBX 4, AES-256, Argon2id, ChaCha20 and gzip.
+    ///
+    /// A fresh random KDF salt and master seed are drawn on every save.
+    pub fn new(database: Database) -> Self {
+        Self {
+            version: KdbxVersion::V4_0,
+            public_custom_data: None,
+            cipher: CipherId::Aes256,
+            compression: Compression::Gzip,
+            kdf: KdfConfig::default_argon2id(),
+            protected_stream: ProtectedStreamAlgo::ChaCha20,
+            database,
+        }
+    }
+
+    /// Read and decrypt the database at `path`. Same as [`read_kdbx`].
+    pub fn open(path: impl AsRef<Path>, credentials: &Credentials) -> AppResult<Self> {
+        read_kdbx(path.as_ref(), credentials)
+    }
+
+    /// Encrypt and save to `path`, replacing it atomically. Same as [`write_kdbx`].
+    pub fn save(&self, path: impl AsRef<Path>, credentials: &Credentials) -> AppResult<()> {
+        write_kdbx(path.as_ref(), self, credentials)
+    }
 }
 
 /// Read a KDBX database from disk.
@@ -1025,6 +1106,33 @@ fn kdf_from_variant_map(map: &BTreeMap<String, VariantValue>) -> AppResult<KdfCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_matches_struct_literal() {
+        let built = Credentials::builder().password("pw").build();
+        assert!(built.key_file.is_none() && built.yubikey.is_none() && built.agent.is_none());
+        let short = Credentials::password("pw");
+        let literal = Credentials {
+            password: Some(SecretString::new("pw".into())),
+            key_file: None,
+            yubikey: None,
+            agent: None,
+        };
+        let kdf = KdfConfig::Aes {
+            seed: vec![1u8; 32],
+            rounds: 10,
+            legacy: false,
+        };
+        let expected = literal.transform_key(&kdf, None).expect("key");
+        assert_eq!(
+            &built.transform_key(&kdf, None).expect("key")[..],
+            &expected[..]
+        );
+        assert_eq!(
+            &short.transform_key(&kdf, None).expect("key")[..],
+            &expected[..]
+        );
+    }
 
     fn test_file() -> (KdbxFile, Credentials) {
         let file = KdbxFile {

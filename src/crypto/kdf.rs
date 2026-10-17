@@ -1,12 +1,31 @@
 use argon2::{Algorithm, Argon2, Block, Params, Version};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
+
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::constants::{KDF_AES_KDBX3, KDF_AES_KDBX4, KDF_ARGON2D, KDF_ARGON2ID};
 use crate::crypto::hash::sha256;
 use crate::error::{AppError, AppResult};
+
+/// A progress callback for key derivation: `hook(done, total)`.
+pub type KdfProgressHook = dyn Fn(u64, u64) + Send + Sync;
+
+static PROGRESS_HOOK: RwLock<Option<Arc<KdfProgressHook>>> = RwLock::new(None);
+
+/// Report the progress of every [`KdfConfig::transform`] in this process to `hook`.
+///
+/// The library never writes to the terminal itself. The `keepassxcr` CLI uses
+/// this to draw a progress bar during long AES-KDF runs, which happen deep
+/// inside [`crate::format::read_kdbx`] and [`crate::format::write_kdbx`].
+/// Pass `None` to remove the hook. See [`KdfConfig::transform_with_progress`]
+/// for when it is called.
+pub fn set_kdf_progress_hook(hook: Option<Arc<KdfProgressHook>>) {
+    if let Ok(mut slot) = PROGRESS_HOOK.write() {
+        *slot = hook;
+    }
+}
 
 /// Supported KDF types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,9 +120,30 @@ impl KdfConfig {
     }
 
     /// Transform a raw composite key. The result is wiped when dropped.
+    ///
+    /// Reports progress to the hook set with [`set_kdf_progress_hook`], if any.
     pub fn transform(&self, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
+        let hook = PROGRESS_HOOK.read().ok().and_then(|hook| hook.clone());
+        match hook {
+            Some(hook) => {
+                self.transform_with_progress(raw_key, &mut |done, total| hook(done, total))
+            }
+            None => self.transform_with_progress(raw_key, &mut |_, _| {}),
+        }
+    }
+
+    /// Transform a raw composite key, calling `progress(done, total)` as it runs.
+    ///
+    /// AES-KDF reports `(0, rounds)` before the first round, then about a
+    /// thousand updates, and `(rounds, rounds)` when done. Argon2 runs as one
+    /// step and reports nothing. The result is wiped when dropped.
+    pub fn transform_with_progress(
+        &self,
+        raw_key: &[u8],
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> AppResult<Zeroizing<Vec<u8>>> {
         match self {
-            Self::Aes { seed, rounds, .. } => aes_kdf(seed, *rounds, raw_key),
+            Self::Aes { seed, rounds, .. } => aes_kdf(seed, *rounds, raw_key, progress),
             Self::Argon2 {
                 kind,
                 salt,
@@ -145,7 +185,12 @@ impl KdfConfig {
     }
 }
 
-fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
+fn aes_kdf(
+    seed: &[u8],
+    rounds: u64,
+    raw_key: &[u8],
+    progress: &mut dyn FnMut(u64, u64),
+) -> AppResult<Zeroizing<Vec<u8>>> {
     use aes::Aes256;
     use cipher::generic_array::GenericArray;
     use cipher::{BlockEncrypt, KeyInit};
@@ -167,39 +212,16 @@ fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<
     let mut block1 = GenericArray::clone_from_slice(&raw_key[..16]);
     let mut block2 = GenericArray::clone_from_slice(&raw_key[16..]);
 
-    let progress = if rounds >= 50_000 {
-        let pb = ProgressBar::new(rounds);
-        pb.set_style(
-            ProgressStyle::with_template("{msg} {wide_bar} {pos}/{len}")
-                .map_err(|_| AppError::Crypto("progress style".to_string()))?,
-        );
-        pb.set_message("AES-KDF");
-        Some(pb)
-    } else {
-        None
-    };
-
     let chunk = (rounds / 1000).max(1);
-    let mut completed = 0u64;
-
-    for _ in 0..rounds {
+    progress(0, rounds);
+    for round in 1..=rounds {
         cipher.encrypt_block(&mut block1);
         cipher.encrypt_block(&mut block2);
-        if let Some(pb) = &progress {
-            completed += 1;
-            if completed % chunk == 0 {
-                pb.inc(chunk);
-            }
+        if round.is_multiple_of(chunk) && round != rounds {
+            progress(round, rounds);
         }
     }
-
-    if let Some(pb) = progress {
-        let remaining = rounds.saturating_sub(pb.position());
-        if remaining > 0 {
-            pb.inc(remaining);
-        }
-        pb.finish_and_clear();
-    }
+    progress(rounds, rounds);
 
     let mut transformed = Zeroizing::new([0u8; 32]);
     transformed[..16].copy_from_slice(&block1);
@@ -305,6 +327,28 @@ mod tests {
         let raw_key = vec![1u8; 32];
         let out = kdf.transform(&raw_key).expect("kdf should run");
         assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn aes_kdf_reports_progress_and_same_key() {
+        let kdf = KdfConfig::Aes {
+            seed: vec![7u8; 32],
+            rounds: 5_000,
+            legacy: false,
+        };
+        let raw_key = vec![1u8; 32];
+        let mut calls = Vec::new();
+        let out = kdf
+            .transform_with_progress(&raw_key, &mut |done, total| calls.push((done, total)))
+            .expect("kdf should run");
+        assert_eq!(calls.first(), Some(&(0, 5_000)));
+        assert_eq!(calls.last(), Some(&(5_000, 5_000)));
+        assert!(calls.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(calls.len(), 1_001);
+        assert_eq!(
+            &out[..],
+            &kdf.transform(&raw_key).expect("kdf should run")[..]
+        );
     }
 
     #[test]

@@ -608,10 +608,10 @@ fn analyze(args: AnalyzeArgs) -> anyhow::Result<()> {
             weak.push((path.clone(), "empty password".to_string()));
             continue;
         }
-        if let Ok(result) = zxcvbn::zxcvbn(password, &[]) {
-            if result.score() < 3 {
-                weak.push((path.clone(), format!("weak score {}", result.score())));
-            }
+        if let Ok(result) = zxcvbn::zxcvbn(password, &[])
+            && result.score() < 3
+        {
+            weak.push((path.clone(), format!("weak score {}", result.score())));
         }
     }
 
@@ -1141,11 +1141,11 @@ fn hibp_check(entries: &[(String, String)], path: &PathBuf) -> AppResult<HashMap
     let reader = io::BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
-        if let Some((hash, count)) = line.split_once(':') {
-            if let Some(entry_path) = hash_to_entry.get(hash) {
-                let count = count.parse::<u64>().unwrap_or(0);
-                results.insert(entry_path.clone(), count);
-            }
+        if let Some((hash, count)) = line.split_once(':')
+            && let Some(entry_path) = hash_to_entry.get(hash)
+        {
+            let count = count.parse::<u64>().unwrap_or(0);
+            results.insert(entry_path.clone(), count);
         }
     }
 

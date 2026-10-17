@@ -1,7 +1,10 @@
 use std::io;
 
 /// Error type for keepassxcr operations.
+///
+/// New variants may be added in minor releases, so a `match` needs a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AppError {
     /// IO-related failures.
     #[error("io error: {0}")]
