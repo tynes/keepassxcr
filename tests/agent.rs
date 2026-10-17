@@ -23,7 +23,8 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Self {
         // Kept short: Unix socket paths are limited to about 100 bytes.
-        let dir = std::env::temp_dir().join(format!("kxa-{}-{name}", std::process::id()));
+        // /tmp, not temp_dir(): macOS temp_dir() is too long for the agent socket path.
+        let dir = std::path::Path::new("/tmp").join(format!("kxa-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("run")).unwrap();
         fs::set_permissions(dir.join("run"), fs::Permissions::from_mode(0o700)).unwrap();

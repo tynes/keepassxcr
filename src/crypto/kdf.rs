@@ -234,16 +234,24 @@ fn argon2_kdf(
 
     let params = Params::new(memory_kib, iterations, parallelism, Some(32))
         .map_err(|err| AppError::Crypto(format!("invalid Argon2 params: {err}")))?;
-    // The memory size comes from the file. Allocate it fallibly so an
-    // impossible value is an error instead of an abort.
-    let block_count = params.block_count();
-    let mut blocks = Vec::new();
-    blocks.try_reserve_exact(block_count).map_err(|_| {
+    // The memory size comes from the file. Refuse more than the machine has and
+    // allocate fallibly, so an impossible value is an error instead of an abort.
+    // The first check matters on macOS, where a huge reservation succeeds and the
+    // process is killed once the memory is touched.
+    let cannot_allocate = || {
         AppError::Crypto(format!(
             "cannot allocate {} MiB for Argon2",
             memory_kib / 1024
         ))
-    })?;
+    };
+    if physical_memory().is_some_and(|total| u64::from(memory_kib) * 1024 > total) {
+        return Err(cannot_allocate());
+    }
+    let block_count = params.block_count();
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(block_count)
+        .map_err(|_| cannot_allocate())?;
     blocks.resize(block_count, Block::default());
     let argon2 = Argon2::new(alg, ver, params);
 
@@ -253,6 +261,26 @@ fn argon2_kdf(
     blocks.zeroize();
     result.map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
     Ok(output)
+}
+
+/// Total physical memory in bytes, when the OS reports it.
+#[cfg(unix)]
+fn physical_memory() -> Option<u64> {
+    // SAFETY: sysconf only reads system configuration values.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let pages = u64::try_from(pages).ok()?;
+    let page_size = u64::try_from(page_size).ok()?;
+    pages.checked_mul(page_size)
+}
+
+#[cfg(not(unix))]
+fn physical_memory() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
