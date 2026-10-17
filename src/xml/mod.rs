@@ -73,11 +73,16 @@ pub struct XmlOutput {
 ///
 /// `attachments` is the KDBX4 inner-header attachment pool; for KDBX3 pass an
 /// empty slice and the pool is read from `Meta/Binaries`.
+///
+/// `header_hash` is the SHA-256 of a KDBX 3.1 file's outer header. When the
+/// document stores a `Meta/HeaderHash` it must match, as in KeePassXC: the
+/// KDBX3 header is otherwise unauthenticated.
 pub fn read_database(
     xml: &[u8],
     attachments: &[PoolBinary],
     protected_stream_key: &[u8],
     algo: ProtectedStreamAlgo,
+    header_hash: Option<&[u8]>,
 ) -> AppResult<Database> {
     let xml = std::str::from_utf8(xml).map_err(|_| AppError::Xml("invalid utf8".to_string()))?;
     let mut reader = Reader::from_str(xml);
@@ -90,20 +95,63 @@ pub fn read_database(
         binaries: attachments.to_vec(),
         meta_binaries: HashMap::new(),
         depth: 0,
+        header_hash: None,
     };
-    parser.parse_document()
+    let database = parser.parse_document()?;
+    if let (Some(expected), Some(stored)) = (header_hash, parser.header_hash.as_deref()) {
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(stored.trim())
+            .map_err(|_| AppError::Format("invalid header hash".to_string()))?;
+        if stored != expected {
+            return Err(AppError::Format("header hash mismatch".to_string()));
+        }
+    }
+    Ok(database)
+}
+
+/// True if saving `database` needs KDBX 4.1 rather than 4.0, following
+/// KeePassXC: group tags, a previous parent group, an entry excluded from
+/// reports, or a custom icon with a name or modification time.
+pub fn requires_kdbx41(database: &Database) -> bool {
+    let meta_needs = database.meta().extra().iter().any(|raw| {
+        raw.name() == "CustomIcons"
+            && (raw.xml().contains("<Name>") || raw.xml().contains("<LastModificationTime>"))
+    });
+    meta_needs || group_requires_kdbx41(database.root())
+}
+
+fn group_requires_kdbx41(group: &Group) -> bool {
+    let group_needs = group.extra().iter().any(|raw| match raw.name() {
+        "Tags" => crate::model::element_text(raw.xml(), "Tags")
+            .is_some_and(|tags| !tags.trim().is_empty()),
+        "PreviousParentGroup" => true,
+        _ => false,
+    });
+    let entry_needs = group.entries().iter().any(|entry| {
+        entry.extra().iter().any(|raw| match raw.name() {
+            "PreviousParentGroup" => true,
+            "QualityCheck" => crate::model::element_text(raw.xml(), "QualityCheck")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("false")),
+            _ => false,
+        })
+    });
+    group_needs || entry_needs || group.groups().iter().any(group_requires_kdbx41)
 }
 
 /// Serialize a database to KeePass XML.
 ///
 /// Protected values are encrypted with the inner stream in document order when
 /// `protect_fields` is true (always the case inside a KDBX file).
+///
+/// `header_hash`, for KDBX 3.1, is the SHA-256 of the outer header and is
+/// stored as `Meta/HeaderHash`.
 pub fn write_database(
     database: &Database,
     protected_stream_key: &[u8],
     algo: ProtectedStreamAlgo,
     protect_fields: bool,
     pool: BinaryPool,
+    header_hash: Option<&[u8]>,
 ) -> AppResult<XmlOutput> {
     let mut output = Vec::new();
     let mut writer = Writer::new_with_indent(Cursor::new(&mut output), b'\t', 1);
@@ -124,7 +172,7 @@ pub fn write_database(
     } else {
         &[]
     };
-    write_meta(&mut writer, database, meta_pool)?;
+    write_meta(&mut writer, database, meta_pool, header_hash)?;
 
     let mut ctx = WriteContext {
         stream: &mut stream,
@@ -169,6 +217,8 @@ struct Parser<'a> {
     meta_binaries: HashMap<usize, PoolBinary>,
     /// Current `Group`/`Entry` nesting depth.
     depth: usize,
+    /// Base64 `Meta/HeaderHash`, if the document has one.
+    header_hash: Option<String>,
 }
 
 /// Deepest `Group`/`History` nesting accepted when parsing.
@@ -305,8 +355,14 @@ impl<'a> Parser<'a> {
                         database.meta_mut().set_description(value);
                     }
                     // Regenerated on write.
-                    "Generator" | "HeaderHash" => {
+                    "Generator" => {
                         self.read_text()?;
+                    }
+                    "HeaderHash" => {
+                        let value = self.read_text()?;
+                        if !value.trim().is_empty() {
+                            self.header_hash = Some(value);
+                        }
                     }
                     "Binaries" => self.parse_meta_binaries()?,
                     _ => {
@@ -795,9 +851,14 @@ fn write_meta<W: std::io::Write>(
     writer: &mut Writer<W>,
     database: &Database,
     binaries: &[PoolBinary],
+    header_hash: Option<&[u8]>,
 ) -> AppResult<()> {
     start(writer, BytesStart::new("Meta"))?;
     write_simple_element(writer, "Generator", "keepassxcr")?;
+    if let Some(hash) = header_hash {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(hash);
+        write_simple_element(writer, "HeaderHash", &encoded)?;
+    }
     write_simple_element(writer, "DatabaseName", database.meta().name())?;
     write_simple_element(writer, "DatabaseDescription", database.meta().description())?;
     write_raw(writer, database.meta().extra())?;
@@ -1031,13 +1092,14 @@ mod tests {
     const KEY: [u8; 32] = [1u8; 32];
 
     fn roundtrip(db: &Database, pool: BinaryPool) -> Database {
-        let output =
-            write_database(db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool).expect("write");
+        let output = write_database(db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool, None)
+            .expect("write");
         read_database(
             &output.xml,
             &output.attachments,
             &KEY,
             ProtectedStreamAlgo::Salsa20,
+            None,
         )
         .expect("read")
     }
@@ -1078,13 +1140,14 @@ mod tests {
 <Entry><UUID>AQEBAQEBAQEBAQEBAQEBAQ==</UUID><Tags>a;b</Tags><Times><Expires>True</Expires></Times>
 <String><Key>Title</Key><Value>E</Value></String><AutoType><Enabled>True</Enabled></AutoType></Entry>
 </Group><DeletedObjects><DeletedObject><UUID>AgICAgICAgICAgICAgICAg==</UUID></DeletedObject></DeletedObjects></Root></KeePassFile>"#;
-        let db = read_database(xml, &[], &KEY, ProtectedStreamAlgo::Salsa20).expect("read");
+        let db = read_database(xml, &[], &KEY, ProtectedStreamAlgo::Salsa20, None).expect("read");
         let output = write_database(
             &db,
             &KEY,
             ProtectedStreamAlgo::Salsa20,
             true,
             BinaryPool::InnerHeader,
+            None,
         )
         .expect("write");
         let text = String::from_utf8(output.xml).expect("utf8");
@@ -1111,8 +1174,8 @@ mod tests {
         db.root_mut().entries_mut().push(entry);
 
         for pool in [BinaryPool::InnerHeader, BinaryPool::Meta] {
-            let output =
-                write_database(&db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool).expect("write");
+            let output = write_database(&db, &KEY, ProtectedStreamAlgo::Salsa20, true, pool, None)
+                .expect("write");
             // The attachment is shared with the history item, so it is stored once.
             if pool == BinaryPool::InnerHeader {
                 assert_eq!(output.attachments.len(), 1);
@@ -1135,6 +1198,7 @@ mod tests {
             ProtectedStreamAlgo::Salsa20,
             true,
             BinaryPool::Meta,
+            None,
         )
         .expect("write");
         let text = String::from_utf8(output.xml).expect("utf8");
@@ -1152,7 +1216,13 @@ mod tests {
     }
 
     fn parse(xml: &str) -> AppResult<Database> {
-        read_database(xml.as_bytes(), &[], &KEY, ProtectedStreamAlgo::Salsa20)
+        read_database(
+            xml.as_bytes(),
+            &[],
+            &KEY,
+            ProtectedStreamAlgo::Salsa20,
+            None,
+        )
     }
 
     #[test]
@@ -1216,6 +1286,7 @@ mod tests {
             ProtectedStreamAlgo::Salsa20,
             true,
             BinaryPool::InnerHeader,
+            None,
         )
         .expect("write");
         String::from_utf8(output.xml).expect("utf8")

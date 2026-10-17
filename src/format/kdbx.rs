@@ -19,14 +19,13 @@ use crate::format::block_stream::{
     hmac_block_key,
 };
 use crate::format::constants::{
-    FILE_VERSION_3_1, FILE_VERSION_4_1, HeaderFieldId, InnerHeaderFieldId, KDBX_SIGNATURE_1,
-    KDBX_SIGNATURE_2,
+    FILE_VERSION_3_1, HeaderFieldId, InnerHeaderFieldId, KDBX_SIGNATURE_1, KDBX_SIGNATURE_2,
 };
 use crate::format::types::{Compression, KdbxVersion};
 use crate::format::variant_map::{VariantValue, read_variant_map, write_variant_map};
 use crate::model::Database;
 use crate::util::{read_u16_le, read_u32_le, read_u64_le, read_vec, write_u16_le, write_u32_le};
-use crate::xml::{BinaryPool, PoolBinary, read_database, write_database};
+use crate::xml::{BinaryPool, PoolBinary, read_database, requires_kdbx41, write_database};
 
 /// Credentials for database operations.
 #[derive(Clone)]
@@ -84,8 +83,12 @@ impl Credentials {
 /// Parsed KDBX file with settings and data.
 #[derive(Debug, Clone)]
 pub struct KdbxFile {
-    /// KDBX version.
+    /// KDBX version. Saving keeps it, except that a 4.0 file is written as
+    /// 4.1 when the database uses a 4.1 feature.
     pub version: KdbxVersion,
+    /// KDBX4 `PublicCustomData` header field: an unencrypted variant map
+    /// that plugins use. Kept byte for byte.
+    pub public_custom_data: Option<Vec<u8>>,
     /// Database cipher.
     pub cipher: CipherId,
     /// Compression settings.
@@ -202,16 +205,18 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
     let transformed = credentials.transform_key(&header.kdf)?;
     let final_key = build_final_key(&header.master_seed, &transformed, credentials)?;
 
-    let payload = if version.is_kdbx4() {
-        read_kdbx4_payload(
+    let (payload, header_hash) = if version.is_kdbx4() {
+        let payload = read_kdbx4_payload(
             &data[header_end..],
             &header,
             header_data,
             &final_key,
             &transformed,
-        )?
+        )?;
+        (payload, None)
     } else {
-        read_kdbx3_payload(&data[header_end..], &header, &final_key)?
+        let payload = read_kdbx3_payload(&data[header_end..], &header, &final_key)?;
+        (payload, Some(crate::crypto::sha256(header_data)))
     };
 
     let database = read_database(
@@ -219,10 +224,12 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
         &payload.attachments,
         &payload.protected_stream_key,
         payload.protected_stream,
+        header_hash.as_ref().map(|hash| &hash[..]),
     )?;
 
     Ok(KdbxFile {
         version,
+        public_custom_data: header.public_custom_data,
         cipher: header.cipher,
         compression: header.compression,
         kdf: header.kdf,
@@ -263,6 +270,7 @@ struct HeaderData {
     protected_stream_key: Option<Vec<u8>>,
     kdf: KdfConfig,
     stream_start_bytes: Option<Vec<u8>>,
+    public_custom_data: Option<Vec<u8>>,
 }
 
 fn read_header(cursor: &mut Cursor<&[u8]>, version: KdbxVersion) -> AppResult<HeaderData> {
@@ -276,6 +284,7 @@ fn read_header(cursor: &mut Cursor<&[u8]>, version: KdbxVersion) -> AppResult<He
     let mut kdf = None;
     let mut transform_seed = None;
     let mut transform_rounds = None;
+    let mut public_custom_data = None;
 
     loop {
         let field_id = {
@@ -333,6 +342,11 @@ fn read_header(cursor: &mut Cursor<&[u8]>, version: KdbxVersion) -> AppResult<He
                 let map = read_variant_map(&mut map_cursor)?;
                 kdf = Some(kdf_from_variant_map(&map)?);
             }
+            x if x == HeaderFieldId::PublicCustomData as u8 && version.is_kdbx4() => {
+                // Check it parses, but keep the original bytes.
+                read_variant_map(&mut Cursor::new(&data))?;
+                public_custom_data = Some(data);
+            }
             _ => {}
         }
     }
@@ -374,6 +388,7 @@ fn read_header(cursor: &mut Cursor<&[u8]>, version: KdbxVersion) -> AppResult<He
         protected_stream_key,
         kdf,
         stream_start_bytes,
+        public_custom_data,
     })
 }
 
@@ -400,20 +415,17 @@ fn read_kdbx3_payload(
     header: &HeaderData,
     final_key: &[u8],
 ) -> AppResult<PayloadData> {
-    let cipher_text = data.to_vec();
-    let plain = decrypt(
-        header.cipher,
-        final_key,
-        &header.encryption_iv,
-        &cipher_text,
-    )?;
+    // With a wrong key the CBC padding is almost always invalid; when it is
+    // not, the start bytes below catch it.
+    let plain = decrypt(header.cipher, final_key, &header.encryption_iv, data)
+        .map_err(|_| AppError::InvalidCredentials)?;
 
     let start_bytes = header
         .stream_start_bytes
         .as_ref()
         .ok_or_else(|| AppError::Format("missing stream start bytes".to_string()))?;
     if plain.len() < start_bytes.len() || &plain[..start_bytes.len()] != start_bytes {
-        return Err(AppError::Format("invalid credentials".to_string()));
+        return Err(AppError::InvalidCredentials);
     }
 
     let block_data = &plain[start_bytes.len()..];
@@ -451,7 +463,8 @@ fn read_kdbx4_payload(
     let header_key = hmac_block_key(u64::MAX, &hmac_key);
     let expected = hmac_sha256(&header_key, header_data)?;
     if header_hmac != expected.to_vec() {
-        return Err(AppError::Format("header HMAC mismatch".to_string()));
+        // The header hash already matched, so the key is what is wrong.
+        return Err(AppError::InvalidCredentials);
     }
 
     let ciphertext = decode_hmac_blocks(&data[(cursor.position() as usize)..], &hmac_key)?;
@@ -604,12 +617,14 @@ fn write_kdbx3(
     )?;
     write_header_field_u16(&mut header, HeaderFieldId::EndOfHeader, b"\r\n\r\n")?;
 
+    let header_hash = crate::crypto::sha256(&header);
     let xml_output = write_database(
         &file.database,
         &protected_stream_key,
         ProtectedStreamAlgo::Salsa20,
         true,
         BinaryPool::Meta,
+        Some(&header_hash),
     )?;
     let payload = if file.compression == Compression::Gzip {
         compress_gzip(&xml_output.xml)?
@@ -644,7 +659,12 @@ fn write_kdbx4(
     let mut header = Vec::new();
     write_u32_le(&mut header, KDBX_SIGNATURE_1)?;
     write_u32_le(&mut header, KDBX_SIGNATURE_2)?;
-    write_u32_le(&mut header, FILE_VERSION_4_1)?;
+    let version = if requires_kdbx41(&file.database) {
+        KdbxVersion::V4_1
+    } else {
+        file.version
+    };
+    write_u32_le(&mut header, version.as_u32())?;
 
     write_header_field_u32(
         &mut header,
@@ -663,6 +683,9 @@ fn write_kdbx4(
     let mut param_bytes = Vec::new();
     write_variant_map(&mut param_bytes, &params)?;
     write_header_field_u32(&mut header, HeaderFieldId::KdfParameters, &param_bytes)?;
+    if let Some(data) = &file.public_custom_data {
+        write_header_field_u32(&mut header, HeaderFieldId::PublicCustomData, data)?;
+    }
     write_header_field_u32(&mut header, HeaderFieldId::EndOfHeader, b"\r\n\r\n")?;
 
     let header_hash = crate::crypto::sha256(&header).to_vec();
@@ -676,6 +699,7 @@ fn write_kdbx4(
         file.protected_stream,
         true,
         BinaryPool::InnerHeader,
+        None,
     )?;
     let attachments = xml_output.attachments;
 
@@ -871,7 +895,8 @@ mod tests {
 
     fn test_file() -> (KdbxFile, Credentials) {
         let file = KdbxFile {
-            version: KdbxVersion::V4,
+            version: KdbxVersion::V4_0,
+            public_custom_data: None,
             cipher: CipherId::Aes256,
             compression: Compression::Gzip,
             kdf: KdfConfig::Argon2 {
@@ -942,6 +967,87 @@ mod tests {
             .map(crate::model::Attachment::protected)
             .collect();
         assert_eq!(flags, vec![false, true]);
+    }
+
+    fn kdbx3_file() -> KdbxFile {
+        let (mut file, _) = test_file();
+        file.version = KdbxVersion::V3_1;
+        file.kdf = KdfConfig::Aes {
+            seed: vec![0u8; 32],
+            rounds: 1,
+            legacy: true,
+        };
+        file.protected_stream = ProtectedStreamAlgo::Salsa20;
+        file
+    }
+
+    #[test]
+    fn version_is_kept_unless_a_41_feature_needs_it() {
+        let (mut file, credentials) = test_file();
+        let saved = write_kdbx_bytes(&file, &credentials).expect("write");
+        let read = read_kdbx_bytes(&saved, &credentials).expect("read");
+        assert_eq!(read.version, KdbxVersion::V4_0);
+
+        file.database
+            .root_mut()
+            .extra_mut()
+            .push(crate::model::RawElement::new(
+                "Tags".to_string(),
+                "<Tags>work</Tags>".to_string(),
+            ));
+        let saved = write_kdbx_bytes(&file, &credentials).expect("write");
+        let read = read_kdbx_bytes(&saved, &credentials).expect("read");
+        assert_eq!(read.version, KdbxVersion::V4_1);
+    }
+
+    #[test]
+    fn public_custom_data_survives_a_save() {
+        let (mut file, credentials) = test_file();
+        let mut map = BTreeMap::new();
+        map.insert(
+            "plugin".to_string(),
+            VariantValue::String("value".to_string()),
+        );
+        map.insert("count".to_string(), VariantValue::UInt64(7));
+        let mut data = Vec::new();
+        write_variant_map(&mut data, &map).expect("map");
+        file.public_custom_data = Some(data.clone());
+
+        let saved = write_kdbx_bytes(&file, &credentials).expect("write");
+        let read = read_kdbx_bytes(&saved, &credentials).expect("read");
+        assert_eq!(read.public_custom_data, Some(data));
+    }
+
+    #[test]
+    fn kdbx3_header_changes_are_detected() {
+        let file = kdbx3_file();
+        let (_, credentials) = test_file();
+        let saved = write_kdbx_bytes(&file, &credentials).expect("write");
+        read_kdbx_bytes(&saved, &credentials).expect("untouched file opens");
+
+        // A comment field changes nothing that decryption uses, so only the
+        // stored header hash can catch it.
+        let mut tampered = saved[..12].to_vec();
+        tampered.extend_from_slice(&[HeaderFieldId::Comment as u8, 3, 0]);
+        tampered.extend_from_slice(b"hi!");
+        tampered.extend_from_slice(&saved[12..]);
+        let err = read_kdbx_bytes(&tampered, &credentials).expect_err("tampered header opened");
+        assert!(err.to_string().contains("header hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn wrong_credentials_are_reported_as_such() {
+        let (file4, credentials) = test_file();
+        let wrong = Credentials {
+            password: Some(SecretString::new("wrong".to_string())),
+            key_file: None,
+            agent: None,
+        };
+        for file in [file4, kdbx3_file()] {
+            let saved = write_kdbx_bytes(&file, &credentials).expect("write");
+            let err = read_kdbx_bytes(&saved, &wrong).expect_err("opened with wrong password");
+            assert!(matches!(err, AppError::InvalidCredentials), "{err}");
+        }
     }
 
     #[test]

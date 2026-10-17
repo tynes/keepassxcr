@@ -91,6 +91,7 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 
     let file = KdbxFile {
         version,
+        public_custom_data: None,
         cipher,
         compression: Compression::Gzip,
         kdf,
@@ -271,6 +272,7 @@ fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
         ProtectedStreamAlgo::Salsa20,
         false,
         BinaryPool::InnerHeader,
+        None,
     )?;
     let mut stdout = io::stdout();
     stdout.write_all(&output.xml)?;
@@ -279,8 +281,13 @@ fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
 
 fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
     let xml_bytes = fs::read(&args.xml)?;
-    let database =
-        crate::xml::read_database(&xml_bytes, &[], &[0u8; 32], ProtectedStreamAlgo::Salsa20)?;
+    let database = crate::xml::read_database(
+        &xml_bytes,
+        &[],
+        &[0u8; 32],
+        ProtectedStreamAlgo::Salsa20,
+        None,
+    )?;
 
     let credentials = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
@@ -290,7 +297,8 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
     }
 
     let file = KdbxFile {
-        version: KdbxVersion::V4,
+        version: KdbxVersion::V4_0,
+        public_custom_data: None,
         cipher: CipherId::Aes256,
         compression: Compression::Gzip,
         kdf: KdfConfig::default_argon2id(),
@@ -914,7 +922,7 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
 fn parse_version(value: u32) -> AppResult<KdbxVersion> {
     match value {
         3 => Ok(KdbxVersion::V3_1),
-        4 => Ok(KdbxVersion::V4),
+        4 => Ok(KdbxVersion::V4_0),
         _ => Err(AppError::InvalidInput("unsupported version".to_string())),
     }
 }
