@@ -209,3 +209,40 @@ fn changing_credentials_locks_the_agent() {
         .stdout(contains("Locked the unlock agent"));
     fixture.cmd(&["status"]).assert().code(1);
 }
+
+#[test]
+fn a_slow_request_does_not_keep_the_agent_alive_past_its_maximum() {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+
+    let fixture = Fixture::new("slow");
+    fixture
+        .cmd(&["unlock", "--idle", "15m", "--max", "3s"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success();
+    let socket = fixture
+        .runtime_files()
+        .into_iter()
+        .find(|name| name.ends_with(".sock"))
+        .expect("agent socket");
+    let socket = fixture.dir.join("run/keepassxcr").join(socket);
+
+    // Any process running as the user (or a hostile database file) can ask
+    // for a KDF that never finishes.
+    let mut stream = UnixStream::connect(&socket).expect("connect");
+    let seed = vec![1u8; 32];
+    let request = serde_json::json!({
+        "op": "transform",
+        "kdf": {"Aes": {"seed": seed, "rounds": 1u64 << 62, "legacy": true}},
+    });
+    writeln!(stream, "{request}").expect("send");
+
+    thread::sleep(Duration::from_secs(6));
+    fixture
+        .cmd(&["status"])
+        .assert()
+        .code(1)
+        .stdout(contains("maximum lifetime reached"));
+    assert!(!socket.exists(), "agent still running");
+}
