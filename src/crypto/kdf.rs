@@ -1,7 +1,8 @@
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::constants::{KDF_AES_KDBX3, KDF_AES_KDBX4, KDF_ARGON2D, KDF_ARGON2ID};
 use crate::crypto::hash::sha256;
@@ -99,8 +100,8 @@ impl KdfConfig {
         }
     }
 
-    /// Transform a raw composite key.
-    pub fn transform(&self, raw_key: &[u8]) -> AppResult<Vec<u8>> {
+    /// Transform a raw composite key. The result is wiped when dropped.
+    pub fn transform(&self, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
         match self {
             Self::Aes { seed, rounds, .. } => aes_kdf(seed, *rounds, raw_key),
             Self::Argon2 {
@@ -144,7 +145,7 @@ impl KdfConfig {
     }
 }
 
-fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Vec<u8>> {
+fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     use aes::Aes256;
     use cipher::generic_array::GenericArray;
     use cipher::{BlockEncrypt, KeyInit};
@@ -200,10 +201,12 @@ fn aes_kdf(seed: &[u8], rounds: u64, raw_key: &[u8]) -> AppResult<Vec<u8>> {
         pb.finish_and_clear();
     }
 
-    let mut transformed = [0u8; 32];
+    let mut transformed = Zeroizing::new([0u8; 32]);
     transformed[..16].copy_from_slice(&block1);
     transformed[16..].copy_from_slice(&block2);
-    Ok(sha256(&transformed).to_vec())
+    block1.as_mut_slice().zeroize();
+    block2.as_mut_slice().zeroize();
+    Ok(Zeroizing::new(sha256(&transformed[..]).to_vec()))
 }
 
 fn argon2_kdf(
@@ -214,7 +217,7 @@ fn argon2_kdf(
     parallelism: u32,
     version: u32,
     raw_key: &[u8],
-) -> AppResult<Vec<u8>> {
+) -> AppResult<Zeroizing<Vec<u8>>> {
     let alg = match kind {
         KdfType::Argon2d => Algorithm::Argon2d,
         KdfType::Argon2id => Algorithm::Argon2id,
@@ -231,12 +234,24 @@ fn argon2_kdf(
 
     let params = Params::new(memory_kib, iterations, parallelism, Some(32))
         .map_err(|err| AppError::Crypto(format!("invalid Argon2 params: {err}")))?;
+    // The memory size comes from the file. Allocate it fallibly so an
+    // impossible value is an error instead of an abort.
+    let block_count = params.block_count();
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(block_count).map_err(|_| {
+        AppError::Crypto(format!(
+            "cannot allocate {} MiB for Argon2",
+            memory_kib / 1024
+        ))
+    })?;
+    blocks.resize(block_count, Block::default());
     let argon2 = Argon2::new(alg, ver, params);
 
-    let mut output = vec![0u8; 32];
-    argon2
-        .hash_password_into(raw_key, salt, &mut output)
-        .map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
+    let mut output = Zeroizing::new(vec![0u8; 32]);
+    let result = argon2.hash_password_into_with_memory(raw_key, salt, &mut output, &mut blocks);
+    // The working memory is derived from the key.
+    blocks.zeroize();
+    result.map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
     Ok(output)
 }
 
@@ -277,5 +292,21 @@ mod tests {
         let raw_key = vec![3u8; 32];
         let out = kdf.transform(&raw_key).expect("argon2 should run");
         assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn impossible_argon2_memory_is_an_error() {
+        let kdf = KdfConfig::Argon2 {
+            kind: KdfType::Argon2id,
+            salt: vec![2u8; 32],
+            iterations: 1,
+            memory_kib: u32::MAX,
+            parallelism: 1,
+            version: 0x13,
+        };
+        let err = kdf
+            .transform(&[3u8; 32])
+            .expect_err("4 TiB cannot be allocated");
+        assert!(err.to_string().contains("cannot allocate"), "{err}");
     }
 }

@@ -150,7 +150,7 @@ pub fn lock(database: Option<&Path>) -> AppResult<Vec<PathBuf>> {
 }
 
 /// Ask the agent to run `kdf` over its composite key.
-pub(super) fn transform(key: &AgentKey, kdf: &KdfConfig) -> AppResult<Vec<u8>> {
+pub(super) fn transform(key: &AgentKey, kdf: &KdfConfig) -> AppResult<Zeroizing<Vec<u8>>> {
     let response = query(&key.socket, &Request::Transform { kdf: kdf.clone() }).map_err(|err| {
         AppError::Locked(format!(
             "locked: the unlock agent for {} stopped ({err}); run 'keepassxcr unlock {}'",
@@ -166,12 +166,11 @@ pub(super) fn transform(key: &AgentKey, kdf: &KdfConfig) -> AppResult<Vec<u8>> {
             "agent answered for another database".to_string(),
         ));
     }
-    let transformed = Zeroizing::new(
-        response
-            .transformed
-            .ok_or_else(|| AppError::Crypto("agent sent no key".to_string()))?,
-    );
+    let transformed = response
+        .transformed
+        .ok_or_else(|| AppError::Crypto("agent sent no key".to_string()))?;
     hex::decode(transformed.as_bytes())
+        .map(Zeroizing::new)
         .map_err(|_| AppError::Crypto("agent sent a malformed key".to_string()))
 }
 

@@ -42,9 +42,17 @@ pub fn write_u64_le<W: Write>(writer: &mut W, value: u64) -> AppResult<()> {
 }
 
 /// Read an exact number of bytes into a vector.
+///
+/// `len` usually comes from the file, so the buffer grows as data actually
+/// arrives instead of being allocated up front: a bogus length in a short or
+/// hostile file fails with "unexpected end of file" rather than a huge
+/// allocation.
 pub fn read_vec<R: Read>(reader: &mut R, len: usize) -> AppResult<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    reader.take(len as u64).read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
     Ok(buf)
 }
 

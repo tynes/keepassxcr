@@ -25,7 +25,7 @@ mod wire;
 #[cfg(unix)]
 pub use client::{credentials_for, lock, state, status_all, unlock};
 #[cfg(unix)]
-pub use server::serve;
+pub use server::{harden_process, serve};
 
 /// Handle to a running agent, used by [`crate::format::Credentials`].
 #[derive(Debug, Clone)]
@@ -36,7 +36,7 @@ pub struct AgentKey {
 
 impl AgentKey {
     /// Ask the agent to run `kdf` over its composite key.
-    pub fn transform(&self, kdf: &KdfConfig) -> AppResult<Vec<u8>> {
+    pub fn transform(&self, kdf: &KdfConfig) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
         #[cfg(unix)]
         return client::transform(self, kdf);
         #[cfg(not(unix))]
@@ -183,6 +183,8 @@ mod unsupported_platform {
     pub fn serve(_database: &Path, _idle: Duration, _max: Duration) -> AppResult<()> {
         Err(unsupported())
     }
+
+    pub fn harden_process() {}
 }
 #[cfg(not(unix))]
 pub use unsupported_platform::*;

@@ -1075,15 +1075,29 @@ class TestRm:
                 stdin_text=pw_stdin,
             )
             assert r.exit_code == 0, f"{binary.name}: {r.stderr}"
-            # Verify removed: Rust deletes fully; original moves to Recycle Bin
-            # so show from root path should fail or show it's recycled
-            if binary.name == "keepassxcr":
-                r2 = run_cli(
-                    binary,
-                    ["show", str(db_path), "ToRemove"] + pw_args,
-                    stdin_text=pw_stdin,
-                )
-                assert r2.exit_code != 0, f"{binary.name}: entry should be gone"
+            # Both move the entry to the Recycle Bin first.
+            r3 = run_cli(
+                binary,
+                ["ls", str(db_path), "Recycle Bin"] + pw_args,
+                stdin_text=pw_stdin,
+            )
+            assert r3.exit_code == 0, f"{binary.name}: {r3.stderr}"
+            _, entries = parse_ls_output(r3.stdout, binary.name)
+            assert "ToRemove" in entries, f"{binary.name}: {r3.stdout}"
+            # Removing it from the Recycle Bin deletes it for good.
+            r4 = run_cli(
+                binary,
+                ["rm", str(db_path), "Recycle Bin/ToRemove"] + pw_args,
+                stdin_text=pw_stdin,
+            )
+            assert r4.exit_code == 0, f"{binary.name}: {r4.stderr}"
+            r5 = run_cli(
+                binary,
+                ["ls", str(db_path), "Recycle Bin"] + pw_args,
+                stdin_text=pw_stdin,
+            )
+            _, entries = parse_ls_output(r5.stdout, binary.name)
+            assert "ToRemove" not in entries, f"{binary.name}: {r5.stdout}"
 
 
 class TestLs:
@@ -1210,6 +1224,15 @@ class TestRmdir:
             )
             groups, _ = parse_ls_output(r2.stdout, binary.name)
             assert "ToRemove" not in groups
+            # Both move the group to the Recycle Bin first.
+            assert "Recycle Bin" in groups, f"{binary.name}: {r2.stdout}"
+            r3 = run_cli(
+                binary,
+                ["ls", str(db_path), "Recycle Bin"] + pw_args,
+                stdin_text=pw_stdin,
+            )
+            groups, _ = parse_ls_output(r3.stdout, binary.name)
+            assert "ToRemove" in groups, f"{binary.name}: {r3.stdout}"
 
     def test_rmdir_root_rejected(self, rust_binary, original_binary, tmp_path):
         for binary in [rust_binary, original_binary]:
@@ -1572,6 +1595,25 @@ class TestAttachmentExport:
             r = run_cli(binary, args, stdin_text=pw_stdin)
             assert r.exit_code == 0, f"{binary.name}: {r.stderr}"
             assert "test attachment content" in r.stdout
+
+    def test_export_keeps_file_private_and_existing_files_intact(
+        self, rust_binary, populated_db_with_attachment, tmp_path
+    ):
+        db_path, _ = populated_db_with_attachment
+        pw_args, pw_stdin = make_auth(rust_binary, TEST_PASSWORD)
+        output_file = tmp_path / "private.txt"
+        args = [
+            "attachment-export", str(db_path), "Entry1",
+            "test_attachment.txt", str(output_file),
+        ] + pw_args
+        r = run_cli(rust_binary, args, stdin_text=pw_stdin)
+        assert r.exit_code == 0, r.stderr
+        assert output_file.stat().st_mode & 0o777 == 0o600
+
+        output_file.write_text("keep me")
+        r = run_cli(rust_binary, args, stdin_text=pw_stdin)
+        assert r.exit_code != 0
+        assert output_file.read_text() == "keep me"
 
 
 class TestAttachmentRm:

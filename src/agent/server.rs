@@ -7,6 +7,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,7 +29,6 @@ struct State {
     /// Transformed keys by hash of the KDF parameters, so repeated reads of an
     /// unchanged file skip the KDF.
     cache: HashMap<[u8; 32], Zeroizing<Vec<u8>>>,
-    last_used: Instant,
 }
 
 struct Agent {
@@ -38,6 +38,9 @@ struct Agent {
     max: Duration,
     /// Inode of the socket this agent bound, to notice being replaced.
     socket_inode: u64,
+    /// Milliseconds after `started` of the last request. Kept outside `state`
+    /// so the expiry watcher never waits for a request in progress.
+    last_used_ms: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -89,10 +92,10 @@ fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, Un
         idle,
         max,
         socket_inode,
+        last_used_ms: AtomicU64::new(0),
         state: Mutex::new(State {
             key,
             cache: HashMap::new(),
-            last_used: now,
         }),
     };
     Ok((agent, listener))
@@ -128,7 +131,7 @@ impl Agent {
     }
 
     fn status(&self) -> Response {
-        let (idle_left, max_left) = self.time_left(&self.state());
+        let (idle_left, max_left) = self.time_left();
         Response {
             database: Some(self.location.database.clone()),
             idle_left_secs: Some(idle_left.as_secs()),
@@ -138,33 +141,50 @@ impl Agent {
     }
 
     fn transform(&self, kdf: &crate::crypto::KdfConfig) -> Response {
-        let mut state = self.state();
-        state.last_used = Instant::now();
+        self.touch();
         let id = match serde_json::to_vec(kdf) {
             Ok(encoded) => sha256(&encoded),
             Err(err) => return error_response(err.to_string()),
         };
-        if !state.cache.contains_key(&id) {
-            let transformed = match kdf.transform(&state.key) {
-                Ok(transformed) => Zeroizing::new(transformed),
-                Err(err) => return error_response(err.to_string()),
-            };
-            lock_memory(&transformed);
-            if state.cache.len() >= CACHE_LIMIT {
-                state.cache.clear();
+        let cached = self.state().cache.get(&id).cloned();
+        let transformed = match cached {
+            Some(transformed) => transformed,
+            None => {
+                // Run the KDF without holding the lock: it can take as long as
+                // the file's settings say, and expiry must not wait for it.
+                let key = self.state().key.clone();
+                lock_memory(&key);
+                let transformed = match kdf.transform(&key) {
+                    Ok(transformed) => transformed,
+                    Err(err) => return error_response(err.to_string()),
+                };
+                lock_memory(&transformed);
+                let mut state = self.state();
+                if state.cache.len() >= CACHE_LIMIT {
+                    state.cache.clear();
+                }
+                state.cache.insert(id, transformed.clone());
+                transformed
             }
-            state.cache.insert(id, transformed);
-        }
+        };
         Response {
             database: Some(self.location.database.clone()),
-            transformed: Some(hex::encode(&state.cache[&id][..])),
+            transformed: Some(Zeroizing::new(hex::encode(&transformed[..]))),
             ..Response::default()
         }
     }
 
-    fn time_left(&self, state: &State) -> (Duration, Duration) {
+    /// Record a request now, restarting the idle timeout.
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_used_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn time_left(&self) -> (Duration, Duration) {
         let now = Instant::now();
-        let idle_left = (state.last_used + self.idle).saturating_duration_since(now);
+        let last_used =
+            self.started + Duration::from_millis(self.last_used_ms.load(Ordering::Relaxed));
+        let idle_left = (last_used + self.idle).saturating_duration_since(now);
         let max_left = (self.started + self.max).saturating_duration_since(now);
         (idle_left.min(max_left), max_left)
     }
@@ -176,7 +196,7 @@ impl Agent {
                 // Another agent took over this database's socket.
                 self.shutdown(None);
             }
-            let (idle_left, max_left) = self.time_left(&self.state());
+            let (idle_left, max_left) = self.time_left();
             if max_left.is_zero() {
                 self.shutdown(Some("maximum lifetime reached"));
             }
@@ -193,10 +213,14 @@ impl Agent {
 
     /// Wipe the key, remove the socket and exit. With a reason, leave an
     /// expiry marker so commands fail instead of prompting.
+    ///
+    /// Never waits for a request in progress: if one holds the state, the key
+    /// is wiped by the process exiting instead.
     fn shutdown(&self, reason: Option<&str>) -> ! {
-        let mut state = self.state();
-        state.key.iter_mut().for_each(|byte| *byte = 0);
-        state.cache.clear();
+        if let Ok(mut state) = self.state.try_lock() {
+            state.key.iter_mut().for_each(|byte| *byte = 0);
+            state.cache.clear();
+        }
         if self.owns_socket() {
             let _ = fs::remove_file(&self.location.socket);
             if let Some(reason) = reason {
@@ -227,7 +251,7 @@ fn write_marker(path: &Path, database: &Path, reason: &str) {
 
 /// Keep the key out of core dumps and, on Linux, away from ptrace and
 /// /proc/<pid>/mem by processes running as the same user.
-fn harden_process() {
+pub fn harden_process() {
     let no_core = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

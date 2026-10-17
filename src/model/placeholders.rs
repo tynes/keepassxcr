@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 use crate::model::{Entry, Group};
 
@@ -27,16 +28,17 @@ pub struct Context<'a> {
 }
 
 /// Every attribute of an entry by name: the five standard ones and the custom ones.
-pub fn attributes(entry: &Entry) -> BTreeMap<String, String> {
+pub fn attributes(entry: &Entry) -> BTreeMap<String, Zeroizing<String>> {
     let mut attributes = entry.custom_fields().clone();
-    attributes.insert("Title".to_string(), entry.title().to_string());
-    attributes.insert("UserName".to_string(), entry.username().to_string());
-    attributes.insert(
-        "Password".to_string(),
-        entry.password().expose_secret().to_string(),
-    );
-    attributes.insert("URL".to_string(), entry.url().to_string());
-    attributes.insert("Notes".to_string(), entry.notes().to_string());
+    for (key, value) in [
+        ("Title", entry.title()),
+        ("UserName", entry.username()),
+        ("Password", entry.password().expose_secret()),
+        ("URL", entry.url()),
+        ("Notes", entry.notes()),
+    ] {
+        attributes.insert(key.to_string(), Zeroizing::new(value.to_string()));
+    }
     attributes
 }
 
@@ -213,7 +215,10 @@ fn resolve_one(entry: &Entry, placeholder: &str, depth: i32, ctx: Context<'_>) -
         Kind::Totp => String::new(),
         Kind::Custom => {
             let key = &placeholder[3..placeholder.len() - 1];
-            attributes(entry).remove(key).unwrap_or_default()
+            attributes(entry)
+                .remove(key)
+                .map(|value| value.to_string())
+                .unwrap_or_default()
         }
         Kind::Reference => resolve_reference(placeholder, depth, ctx),
         Kind::DateTime { utc, part } => resolve_all(entry, &date_time(utc, part), depth - 1, ctx),
@@ -284,7 +289,9 @@ fn find_entry<'a>(group: &'a Group, search_in: char, term: &str) -> Option<&'a E
             'A' => entry.url() == term,
             'N' => entry.notes() == term,
             'I' => uuid.flatten() == Some(entry.uuid()),
-            'O' => attributes(entry).values().any(|value| value == term),
+            'O' => attributes(entry)
+                .values()
+                .any(|value| value.as_str() == term),
             _ => false,
         };
         if found {

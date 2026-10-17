@@ -25,6 +25,13 @@ pub enum VariantValue {
 }
 
 /// Read a variant map from the reader.
+/// The bytes of a fixed-size value, or an error naming its type.
+fn fixed<const N: usize>(bytes: &[u8], what: &str) -> AppResult<[u8; N]> {
+    bytes
+        .try_into()
+        .map_err(|_| AppError::Format(format!("invalid {what} value length")))
+}
+
 pub fn read_variant_map<R: Read>(reader: &mut R) -> AppResult<BTreeMap<String, VariantValue>> {
     let version = read_u16_le(reader)? & VARIANT_MAP_CRITICAL_MASK;
     if version > (VARIANT_MAP_VERSION & VARIANT_MAP_CRITICAL_MASK) {
@@ -62,42 +69,20 @@ pub fn read_variant_map<R: Read>(reader: &mut R) -> AppResult<BTreeMap<String, V
 
         let value = match field_type {
             x if x == VariantFieldType::Bool as u8 => {
-                if value_bytes.len() != 1 {
-                    return Err(AppError::Format("invalid bool value length".to_string()));
-                }
-                VariantValue::Bool(value_bytes[0] != 0)
+                let [byte] = fixed(&value_bytes, "bool")?;
+                VariantValue::Bool(byte != 0)
             }
             x if x == VariantFieldType::Int32 as u8 => {
-                if value_bytes.len() != 4 {
-                    return Err(AppError::Format("invalid int32 value length".to_string()));
-                }
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&value_bytes);
-                VariantValue::Int32(i32::from_le_bytes(buf))
+                VariantValue::Int32(i32::from_le_bytes(fixed(&value_bytes, "int32")?))
             }
             x if x == VariantFieldType::UInt32 as u8 => {
-                if value_bytes.len() != 4 {
-                    return Err(AppError::Format("invalid uint32 value length".to_string()));
-                }
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&value_bytes);
-                VariantValue::UInt32(u32::from_le_bytes(buf))
+                VariantValue::UInt32(u32::from_le_bytes(fixed(&value_bytes, "uint32")?))
             }
             x if x == VariantFieldType::Int64 as u8 => {
-                if value_bytes.len() != 8 {
-                    return Err(AppError::Format("invalid int64 value length".to_string()));
-                }
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&value_bytes);
-                VariantValue::Int64(i64::from_le_bytes(buf))
+                VariantValue::Int64(i64::from_le_bytes(fixed(&value_bytes, "int64")?))
             }
             x if x == VariantFieldType::UInt64 as u8 => {
-                if value_bytes.len() != 8 {
-                    return Err(AppError::Format("invalid uint64 value length".to_string()));
-                }
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&value_bytes);
-                VariantValue::UInt64(u64::from_le_bytes(buf))
+                VariantValue::UInt64(u64::from_le_bytes(fixed(&value_bytes, "uint64")?))
             }
             x if x == VariantFieldType::String as u8 => {
                 let value = String::from_utf8(value_bytes)

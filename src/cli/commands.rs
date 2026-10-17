@@ -24,8 +24,11 @@ use crate::cli::{
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
 use crate::format::{Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, write_kdbx};
-use crate::model::{Attachment, Database, Entry, Group, placeholders};
+use crate::model::{Attachment, Database, Entry, Group, Removal, placeholders};
 use crate::xml::{BinaryPool, write_database};
+
+/// Seconds before `clip` clears the clipboard, as in keepassxc-cli.
+const DEFAULT_CLIP_TIMEOUT_SECS: u64 = 10;
 
 /// Dispatch CLI commands.
 pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
@@ -91,6 +94,7 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 
     let file = KdbxFile {
         version,
+        public_custom_data: None,
         cipher,
         compression: Compression::Gzip,
         kdf,
@@ -151,7 +155,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
         }
         None if args.source_key_file.is_none() => {
             let password = read_secret("Password for source database: ")?;
-            (!password.is_empty()).then(|| SecretString::new(password))
+            (!password.is_empty()).then(|| into_secret(password))
         }
         None => None,
     };
@@ -166,98 +170,21 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
     };
     let source = read_kdbx(&args.source, &source_credentials)?;
 
-    let stats = merge_databases(&mut target.database, &source.database);
+    let stats = crate::model::merge::merge(
+        &mut target.database,
+        &source.database,
+        crate::model::merge::MergeMode::KeepNewer,
+    );
     write_kdbx(&args.database, &target, &credentials)?;
     println!(
-        "Merged {} into {}: {} added, {} updated.",
+        "Merged {} into {}: {} added, {} updated, {} moved.",
         args.source.display(),
         args.database.display(),
         stats.added,
-        stats.updated
+        stats.updated,
+        stats.moved
     );
     Ok(())
-}
-
-/// Counts reported by [`merge_databases`].
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MergeStats {
-    added: usize,
-    updated: usize,
-}
-
-/// Merge `source` into `target` by UUID, keeping the newer version of each entry.
-///
-/// This follows KeePassXC's default "keep newer" mode: entries and groups are
-/// matched by UUID wherever they are in the tree, new ones are added under
-/// their (matched or newly created) parent group, and when both sides have an
-/// entry the one with the later modification time wins. The losing version is
-/// kept in the entry history, so nothing is lost. The source root group maps
-/// onto the target root group. Deletions recorded in the source are not
-/// applied.
-fn merge_databases(target: &mut Database, source: &Database) -> MergeStats {
-    let mut stats = MergeStats::default();
-    let root_uuid = target.root().uuid();
-    merge_group_contents(target.root_mut(), source.root(), root_uuid, &mut stats);
-    stats
-}
-
-fn merge_group_contents(
-    target_root: &mut Group,
-    source: &Group,
-    target_group: uuid::Uuid,
-    stats: &mut MergeStats,
-) {
-    for entry in source.entries() {
-        if let Some(existing) = target_root.entry_by_uuid_mut(entry.uuid()) {
-            if merge_entry(existing, entry) {
-                stats.updated += 1;
-            }
-        } else if let Some(group) = target_root.group_by_uuid_mut(target_group) {
-            group.entries_mut().push(entry.clone());
-            stats.added += 1;
-        }
-    }
-    for child in source.groups() {
-        if target_root.group_by_uuid(child.uuid()).is_none()
-            && let Some(parent) = target_root.group_by_uuid_mut(target_group)
-        {
-            parent.groups_mut().push(child.shell());
-        }
-        merge_group_contents(target_root, child, child.uuid(), stats);
-    }
-}
-
-/// Merge one entry; returns true if the target's current version changed.
-fn merge_entry(target: &mut Entry, source: &Entry) -> bool {
-    let target_time = target.last_modification_secs();
-    let source_time = source.last_modification_secs();
-    if source_time == target_time {
-        return false;
-    }
-
-    let mut history: Vec<Entry> = target
-        .history()
-        .iter()
-        .chain(source.history())
-        .cloned()
-        .collect();
-    let source_is_newer = source_time > target_time;
-    let (mut winner, loser) = if source_is_newer {
-        (source.clone(), target.clone())
-    } else {
-        (target.clone(), source.clone())
-    };
-    let mut loser = loser;
-    loser.history_mut().clear();
-    history.push(loser);
-
-    // Oldest first, without duplicate versions.
-    history.sort_by_key(|item| item.last_modification_secs());
-    history.dedup_by_key(|item| item.last_modification_secs());
-    history.retain(|item| item.last_modification_secs() != winner.last_modification_secs());
-    *winner.history_mut() = history;
-    *target = winner;
-    source_is_newer
 }
 
 fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
@@ -271,6 +198,7 @@ fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
         ProtectedStreamAlgo::Salsa20,
         false,
         BinaryPool::InnerHeader,
+        None,
     )?;
     let mut stdout = io::stdout();
     stdout.write_all(&output.xml)?;
@@ -279,8 +207,13 @@ fn export_db(args: DbExportArgs) -> anyhow::Result<()> {
 
 fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
     let xml_bytes = fs::read(&args.xml)?;
-    let database =
-        crate::xml::read_database(&xml_bytes, &[], &[0u8; 32], ProtectedStreamAlgo::Salsa20)?;
+    let database = crate::xml::read_database(
+        &xml_bytes,
+        &[],
+        &[0u8; 32],
+        ProtectedStreamAlgo::Salsa20,
+        None,
+    )?;
 
     let credentials = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
@@ -290,7 +223,8 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
     }
 
     let file = KdbxFile {
-        version: KdbxVersion::V4,
+        version: KdbxVersion::V4_0,
+        public_custom_data: None,
         cipher: CipherId::Aes256,
         compression: Compression::Gzip,
         kdf: KdfConfig::default_argon2id(),
@@ -330,16 +264,20 @@ fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
 
     let password = if args.password_prompt {
         let value = read_secret("Entry password: ")?;
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            Some(into_secret(value))
+        }
     } else if args.generate {
-        Some(generate_password(password_options_from_args(
-            &args.password_options,
-        ))?)
+        Some(SecretString::new(generate_password(
+            password_options_from_args(&args.password_options),
+        )?))
     } else {
         None
     };
     if let Some(pass) = password {
-        entry.set_password(SecretString::new(pass));
+        entry.set_password(pass);
     }
 
     group.entries_mut().push(entry);
@@ -351,13 +289,14 @@ fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
 fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
+    let limits = file.database.meta().history_limits();
     let entry = file
         .database
         .entry_by_path_mut(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
     // Keep the previous version in the entry history, like KeePassXC does.
-    entry.begin_update();
+    entry.begin_update(limits);
     if let Some(value) = args.title {
         entry.set_title(value);
     }
@@ -373,16 +312,20 @@ fn edit_entry(args: EntryEditArgs) -> anyhow::Result<()> {
 
     let password = if args.password_prompt {
         let value = read_secret("Entry password: ")?;
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            Some(into_secret(value))
+        }
     } else if args.generate {
-        Some(generate_password(password_options_from_args(
-            &args.password_options,
-        ))?)
+        Some(SecretString::new(generate_password(
+            password_options_from_args(&args.password_options),
+        )?))
     } else {
         None
     };
     if let Some(pass) = password {
-        entry.set_password(SecretString::new(pass));
+        entry.set_password(pass);
     }
 
     write_kdbx(&args.database, &file, &credentials)?;
@@ -445,14 +388,19 @@ fn show_entry(args: EntryShowArgs) -> anyhow::Result<()> {
 fn remove_entry(args: EntryPathArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
-    let removed = remove_entry_from_group(file.database.root_mut(), &group_path, title);
-    if !removed {
-        return Err(anyhow::anyhow!(AppError::InvalidInput(
-            "entry not found".to_string(),
-        )));
-    }
+    let uuid = file
+        .database
+        .entry_by_path(&group_path, title)
+        .map(Entry::uuid)
+        .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
+    // Like keepassxc-cli: to the recycle bin, or for good if it is off or
+    // the entry is already there.
+    let removal = file.database.recycle_entry(uuid);
     write_kdbx(&args.database, &file, &credentials)?;
-    println!("Entry removed.");
+    match removal {
+        Some(Removal::Recycled) => println!("Entry moved to the recycle bin."),
+        _ => println!("Entry removed."),
+    }
     Ok(())
 }
 
@@ -490,14 +438,17 @@ fn remove_group(args: GroupPathArgs) -> anyhow::Result<()> {
             "cannot remove root group".to_string(),
         )));
     }
-    let removed = remove_group_by_path(file.database.root_mut(), &path);
-    if !removed {
-        return Err(anyhow::anyhow!(AppError::InvalidInput(
-            "group not found".to_string(),
-        )));
-    }
+    let uuid = file
+        .database
+        .group_by_path(&path)
+        .map(Group::uuid)
+        .ok_or_else(|| AppError::InvalidInput("group not found".to_string()))?;
+    let removal = file.database.recycle_group(uuid);
     write_kdbx(&args.database, &file, &credentials)?;
-    println!("Group removed.");
+    match removal {
+        Some(Removal::Recycled) => println!("Group moved to the recycle bin."),
+        _ => println!("Group removed."),
+    }
     Ok(())
 }
 
@@ -505,13 +456,18 @@ fn move_entry(args: EntryMoveArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (source_path, title) = split_entry_path(&args.entry)?;
     let dest_path = split_group_path(Some(&args.group))?;
-    let entry = take_entry(file.database.root_mut(), &source_path, title)
+    let entry = file
+        .database
+        .entry_by_path(&source_path, title)
+        .map(Entry::uuid)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
     let dest_group = file
         .database
-        .group_by_path_mut(&dest_path)
+        .group_by_path(&dest_path)
+        .map(Group::uuid)
         .ok_or_else(|| AppError::InvalidInput("destination group not found".to_string()))?;
-    dest_group.entries_mut().push(entry);
+    // Records the previous group and the move time, like KeePassXC.
+    file.database.move_entry(entry, dest_group);
     write_kdbx(&args.database, &file, &credentials)?;
     println!("Entry moved.");
     Ok(())
@@ -530,13 +486,14 @@ fn search(args: SearchArgs) -> anyhow::Result<()> {
 fn attachment_import(args: AttachmentImportArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
+    let limits = file.database.meta().history_limits();
     let entry = file
         .database
         .entry_by_path_mut(&group_path, title)
         .ok_or_else(|| AppError::InvalidInput("entry not found".to_string()))?;
 
     let data = fs::read(&args.file)?;
-    entry.begin_update();
+    entry.begin_update(limits);
     entry
         .attachments_mut()
         .push(Attachment::new(args.name, data));
@@ -560,7 +517,16 @@ fn attachment_export(args: AttachmentExportArgs) -> anyhow::Result<()> {
         .ok_or_else(|| AppError::InvalidInput("attachment not found".to_string()))?;
 
     if let Some(output) = args.output {
-        fs::write(output, attachment.data())?;
+        // Attachments are often secrets: never replace an existing file, and
+        // keep the new one readable by its owner only.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut out = options
+            .open(&output)
+            .with_context(|| format!("cannot create {}", output.display()))?;
+        out.write_all(attachment.data())?;
     } else {
         io::stdout().write_all(attachment.data())?;
     }
@@ -570,6 +536,7 @@ fn attachment_export(args: AttachmentExportArgs) -> anyhow::Result<()> {
 fn attachment_remove(args: AttachmentRemoveArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
+    let limits = file.database.meta().history_limits();
     let entry = file
         .database
         .entry_by_path_mut(&group_path, title)
@@ -584,7 +551,7 @@ fn attachment_remove(args: AttachmentRemoveArgs) -> anyhow::Result<()> {
             "attachment not found".to_string(),
         )));
     }
-    entry.begin_update();
+    entry.begin_update(limits);
     entry
         .attachments_mut()
         .retain(|attachment| attachment.name() != args.name);
@@ -608,17 +575,24 @@ fn clip(args: ClipArgs) -> anyhow::Result<()> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
     clipboard
-        .set_text(value.clone())
+        .set_text(value.as_str())
         .map_err(|err| AppError::Clipboard(format!("clipboard error: {err}")))?;
 
-    if let Some(timeout) = args.timeout {
+    println!("Copied {} to clipboard.", args.field);
+
+    // Like keepassxc-cli: clear after 10 seconds unless told otherwise, and
+    // only if the clipboard still holds what we put there.
+    let timeout = args.timeout.unwrap_or(DEFAULT_CLIP_TIMEOUT_SECS);
+    if timeout > 0 {
+        println!("Clearing the clipboard in {timeout} seconds...");
         thread::sleep(Duration::from_secs(timeout));
-        if let Err(err) = clipboard.set_text("") {
+        let unchanged = clipboard
+            .get_text()
+            .is_ok_and(|current| current == value.as_str());
+        if unchanged && let Err(err) = clipboard.clear() {
             error!("Failed to clear clipboard: {err}");
         }
     }
-
-    println!("Copied {} to clipboard.", args.field);
     Ok(())
 }
 
@@ -714,7 +688,7 @@ fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
     }
     // Fail on a wrong password now, not on the first command that uses the agent.
     read_kdbx(&args.database, &credentials)?;
-    let raw_key = Zeroizing::new(credentials.composite_key()?.raw_key());
+    let raw_key = credentials.composite_key()?.raw_key();
     let status = agent::unlock(&args.database, &raw_key, args.idle, args.max)?;
     println!("Unlocked {}", describe_unlocked(&status));
     Ok(())
@@ -835,7 +809,7 @@ fn build_credentials_with(
         if prompt.is_empty() {
             None
         } else {
-            Some(SecretString::new(prompt))
+            Some(into_secret(prompt))
         }
     };
 
@@ -854,13 +828,20 @@ fn build_credentials_with(
 
 /// Read a secret from the terminal without echo, or a line from stdin when
 /// stdin is not a terminal (so passwords can be piped in, like keepassxc-cli).
-fn read_secret(prompt: &str) -> io::Result<String> {
+fn read_secret(prompt: &str) -> io::Result<Zeroizing<String>> {
     if io::stdin().is_terminal() {
-        return rpassword::prompt_password(prompt);
+        return rpassword::prompt_password(prompt).map(Zeroizing::new);
     }
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    let len = line.trim_end_matches(['\r', '\n']).len();
+    line.truncate(len);
+    Ok(line)
+}
+
+/// Move a wiped-on-drop secret into a `SecretString` without copying it.
+fn into_secret(mut value: Zeroizing<String>) -> SecretString {
+    SecretString::new(std::mem::take(&mut *value))
 }
 
 /// Warn that passwords given as arguments are visible to other local users.
@@ -914,7 +895,7 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
 fn parse_version(value: u32) -> AppResult<KdbxVersion> {
     match value {
         3 => Ok(KdbxVersion::V3_1),
-        4 => Ok(KdbxVersion::V4),
+        4 => Ok(KdbxVersion::V4_0),
         _ => Err(AppError::InvalidInput("unsupported version".to_string())),
     }
 }
@@ -974,7 +955,7 @@ enum Lookup {
     /// `Uuid` or `Tags`, printed as is.
     Field(String),
     /// An attribute's raw value; placeholders are not resolved yet.
-    Attribute(String),
+    Attribute(Zeroizing<String>),
     Unknown,
     /// Several attributes match case-insensitively, sorted by name.
     Ambiguous(Vec<String>),
@@ -992,7 +973,7 @@ fn lookup_attribute(entry: &Entry, name: &str) -> Lookup {
     if let Some(value) = attributes.remove(name) {
         return Lookup::Attribute(value);
     }
-    let mut matches: Vec<(String, String)> = attributes
+    let mut matches: Vec<(String, Zeroizing<String>)> = attributes
         .into_iter()
         .filter(|(key, _)| key.to_lowercase() == name.to_lowercase())
         .collect();
@@ -1006,31 +987,13 @@ fn lookup_attribute(entry: &Entry, name: &str) -> Lookup {
 /// Tags as KeePassXC 2.7 shows them: split on `,`, `;` or tab, trimmed,
 /// deduplicated, sorted and joined with `,`.
 fn entry_tags(entry: &Entry) -> String {
-    let Some(raw) = entry.extra().iter().find(|raw| raw.name() == "Tags") else {
-        return String::new();
-    };
-    let xml = raw.xml();
-    let text = xml
-        .find('>')
-        .and_then(|start| {
-            let end = xml.rfind("</")?;
-            (end > start).then(|| &xml[start + 1..end])
-        })
-        .unwrap_or_default();
-    let text =
-        quick_xml::escape::unescape(text).map_or_else(|_| text.to_string(), |t| t.into_owned());
-    let tags: std::collections::BTreeSet<&str> = text
-        .split([',', ';', '\t'])
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .collect();
-    tags.into_iter().collect::<Vec<_>>().join(",")
+    entry.tags().join(",")
 }
 
-/// Raw value of an attribute for `clip`, matched like [`lookup_attribute`].
-fn entry_attribute(entry: &Entry, name: &str) -> Option<String> {
+fn entry_attribute(entry: &Entry, name: &str) -> Option<Zeroizing<String>> {
     match lookup_attribute(entry, name) {
-        Lookup::Field(value) | Lookup::Attribute(value) => Some(value),
+        Lookup::Field(value) => Some(Zeroizing::new(value)),
+        Lookup::Attribute(value) => Some(value),
         Lookup::Unknown | Lookup::Ambiguous(_) => None,
     }
 }
@@ -1064,50 +1027,6 @@ fn ensure_group_path<'a>(mut group: &'a mut Group, path: &[&str]) -> &'a mut Gro
         group = next;
     }
     group
-}
-
-fn remove_group_by_path(group: &mut Group, path: &[&str]) -> bool {
-    if path.len() == 1 {
-        let name = path[0];
-        let before = group.groups().len();
-        group.groups_mut().retain(|child| child.name() != name);
-        return group.groups().len() != before;
-    }
-
-    let (head, tail) = path.split_at(1);
-    if let Some(child) = group.find_group_mut(head[0]) {
-        return remove_group_by_path(child, tail);
-    }
-    false
-}
-
-fn remove_entry_from_group(group: &mut Group, path: &[&str], title: &str) -> bool {
-    if path.is_empty() {
-        let before = group.entries().len();
-        group.entries_mut().retain(|entry| entry.title() != title);
-        return group.entries().len() != before;
-    }
-    let (head, tail) = path.split_at(1);
-    if let Some(child) = group.find_group_mut(head[0]) {
-        return remove_entry_from_group(child, tail, title);
-    }
-    false
-}
-
-fn take_entry(group: &mut Group, path: &[&str], title: &str) -> Option<Entry> {
-    if path.is_empty() {
-        let mut index = None;
-        for (idx, entry) in group.entries().iter().enumerate() {
-            if entry.title() == title {
-                index = Some(idx);
-                break;
-            }
-        }
-        return index.map(|idx| group.entries_mut().remove(idx));
-    }
-    let (head, tail) = path.split_at(1);
-    let child = group.find_group_mut(head[0])?;
-    take_entry(child, tail, title)
 }
 
 fn collect_search_results(group: &Group, prefix: &str, term: &str, output: &mut Vec<String>) {
@@ -1306,19 +1225,27 @@ mod tests {
         entry.set_password(SecretString::new("pw\nsecond line".to_string()));
         entry.set_custom_field("RPC_URL".to_string(), "http://x".to_string(), false);
         assert_eq!(
-            entry_attribute(&entry, "UserName").as_deref(),
+            entry_attribute(&entry, "UserName")
+                .as_deref()
+                .map(String::as_str),
             Some("alice")
         );
         assert_eq!(
-            entry_attribute(&entry, "password").as_deref(),
+            entry_attribute(&entry, "password")
+                .as_deref()
+                .map(String::as_str),
             Some("pw\nsecond line")
         );
         assert_eq!(
-            entry_attribute(&entry, "RPC_URL").as_deref(),
+            entry_attribute(&entry, "RPC_URL")
+                .as_deref()
+                .map(String::as_str),
             Some("http://x")
         );
         assert_eq!(
-            entry_attribute(&entry, "rpc_url").as_deref(),
+            entry_attribute(&entry, "rpc_url")
+                .as_deref()
+                .map(String::as_str),
             Some("http://x")
         );
         assert_eq!(entry_attribute(&entry, "missing"), None);
@@ -1339,70 +1266,6 @@ mod tests {
         })
         .expect("password");
         assert_eq!(password.len(), 16);
-    }
-
-    fn entry_at(title: &str, password: &str, time: &str) -> Entry {
-        let mut entry = Entry::new(title.to_string());
-        entry.set_password(SecretString::new(password.to_string()));
-        entry.extra_mut().push(crate::model::RawElement::new(
-            "Times".to_string(),
-            format!("<Times><LastModificationTime>{time}</LastModificationTime></Times>"),
-        ));
-        entry
-    }
-
-    #[test]
-    fn merge_keeps_newer_entry_and_history() {
-        let mut target = Database::new("Target".to_string());
-        let old = entry_at("Bank", "old", "2024-01-01T00:00:00Z");
-        let uuid = old.uuid();
-        target.root_mut().entries_mut().push(old);
-
-        let mut source = Database::new("Source".to_string());
-        let mut newer = entry_at("Bank", "new", "2025-01-01T00:00:00Z");
-        newer.set_uuid(uuid);
-        source.root_mut().entries_mut().push(newer);
-        let mut group = Group::new("Work".to_string());
-        group
-            .entries_mut()
-            .push(entry_at("Mail", "m", "2025-01-01T00:00:00Z"));
-        source.root_mut().groups_mut().push(group);
-
-        let stats = merge_databases(&mut target, &source);
-        assert_eq!(
-            stats,
-            MergeStats {
-                added: 1,
-                updated: 1
-            }
-        );
-        let bank = &target.root().entries()[0];
-        assert_eq!(bank.password().expose_secret(), "new");
-        assert_eq!(bank.history()[0].password().expose_secret(), "old");
-        assert_eq!(target.root().groups()[0].entries()[0].title(), "Mail");
-
-        // Merging the same source again changes nothing.
-        let again = merge_databases(&mut target, &source);
-        assert_eq!(again, MergeStats::default());
-        assert_eq!(target.root().entries().len(), 1);
-        assert_eq!(target.root().groups().len(), 1);
-    }
-
-    #[test]
-    fn merge_keeps_target_when_newer() {
-        let mut target = Database::new("Target".to_string());
-        let current = entry_at("Bank", "current", "2025-01-01T00:00:00Z");
-        let uuid = current.uuid();
-        target.root_mut().entries_mut().push(current);
-        let mut source = Database::new("Source".to_string());
-        let mut stale = entry_at("Bank", "stale", "2024-01-01T00:00:00Z");
-        stale.set_uuid(uuid);
-        source.root_mut().entries_mut().push(stale);
-
-        merge_databases(&mut target, &source);
-        let bank = &target.root().entries()[0];
-        assert_eq!(bank.password().expose_secret(), "current");
-        assert_eq!(bank.history()[0].password().expose_secret(), "stale");
     }
 
     #[test]

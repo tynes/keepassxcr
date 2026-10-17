@@ -15,6 +15,10 @@ pub enum AppError {
     #[error("format error: {0}")]
     Format(String),
 
+    /// The password, key file or other credentials do not open the database.
+    #[error("invalid credentials: wrong password or key file")]
+    InvalidCredentials,
+
     /// XML parsing or serialization failures.
     #[error("xml error: {0}")]
     Xml(String),
