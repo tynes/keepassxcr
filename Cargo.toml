@@ -2,6 +2,26 @@
 name = "keepassxcr"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A Rust reimplementation of keepassxc-cli, and a library for reading and writing KeePass KDBX 3.1/4.x databases"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tynes/keepassxcr"
+homepage = "https://github.com/tynes/keepassxcr"
+documentation = "https://docs.rs/keepassxcr"
+readme = "README.md"
+keywords = ["keepass", "keepassxc", "kdbx", "password-manager", "cli"]
+categories = ["command-line-utilities", "cryptography", "authentication"]
+# Ship only what builds the crate. The test suites, fixtures, compatibility
+# harness and the KeePassXC submodule stay in the repository.
+include = ["/src/**/*.rs", "/assets/diceware.txt", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[lib]
+name = "keepassxcr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keepassxcr"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

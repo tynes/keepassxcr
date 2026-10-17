@@ -1,21 +1,68 @@
 # keepassxcr
 
-A Rust reimplementation of the KeePassXC command-line interface.
+[![crates.io](https://img.shields.io/crates/v/keepassxcr.svg)](https://crates.io/crates/keepassxcr)
+[![docs.rs](https://docs.rs/keepassxcr/badge.svg)](https://docs.rs/keepassxcr)
+
+A Rust reimplementation of the KeePassXC command-line interface, and a library for reading and
+writing KeePass databases.
 
 - Reads and writes **KDBX 3.1** and **KDBX 4.x** databases
 - CLI-compatible with `keepassxc-cli`
 - Pure Rust cryptography (no C bindings)
-- v0.1.0 — early development
+- v0.1.0 — early development; keep a backup of any database you use it on
 
-## Build
+## Install
 
-Requires the **Rust 2024 edition** (rustc 1.85+).
+Requires Rust 1.88 or newer.
 
 ```sh
-cargo build --release
+cargo install keepassxcr --locked
 ```
 
-The binary is at `target/release/keepassxcr`.
+This puts `keepassxcr` in `~/.cargo/bin`. `--locked` builds with the exact dependency versions
+the release was tested with.
+
+On Linux the build needs no system libraries (YubiKey access goes straight to `/dev/hidraw*`).
+On macOS it compiles hidapi's small C backend for IOKit, so the Xcode command line tools must be
+installed (`xcode-select --install`).
+
+### From source
+
+```sh
+git clone https://github.com/tynes/keepassxcr
+cd keepassxcr
+cargo build --release      # binary at target/release/keepassxcr
+cargo install --path .     # or install it into ~/.cargo/bin
+```
+
+## Using it as a library
+
+```sh
+cargo add keepassxcr
+```
+
+The crate exposes the same code the CLI uses. `keepassxcr::format::read_kdbx` and `write_kdbx`
+open and save a database with a `Credentials` (password, key file, YubiKey slot), and
+`keepassxcr::model` holds the groups and entries:
+
+```rust
+use keepassxcr::format::{Credentials, read_kdbx};
+use keepassxcr::secrecy::{ExposeSecret, SecretString};
+
+let credentials = Credentials {
+    password: Some(SecretString::new("correct horse battery staple".into())),
+    key_file: None,
+    yubikey: None,
+    agent: None,
+};
+let file = read_kdbx("passwords.kdbx".as_ref(), &credentials)?;
+if let Some(entry) = file.database.entry_by_path(&["Email"], "Gmail") {
+    println!("{}: {}", entry.username(), entry.password().expose_secret());
+}
+```
+
+The [crate documentation](https://docs.rs/keepassxcr) has a full example that creates and saves a
+database. The library API is shaped by the CLI and may change between 0.x releases.
 
 ## Usage
 
@@ -297,6 +344,30 @@ The `keepassxc/` directory is a Git submodule pointing to the original C++ KeePa
 ```sh
 git submodule update --init
 ```
+
+## Releasing
+
+Releases are published by `.github/workflows/release.yml` when a `v*` tag is pushed:
+
+1. Move the `Unreleased` notes in `CHANGELOG.md` under the new version, and bump `version` in
+   `Cargo.toml` to match. Merge that to `main`.
+2. Tag the merge commit and push the tag:
+   ```sh
+   git tag -a v0.1.0 -m "keepassxcr 0.1.0"
+   git push origin v0.1.0
+   ```
+3. The workflow checks that the tag matches `Cargo.toml`, runs the tests, publishes to crates.io
+   with the `CARGO_REGISTRY_TOKEN` repository secret, and creates the GitHub release from that
+   version's `CHANGELOG.md` section.
+
+To publish by hand instead: `cargo publish --dry-run`, then `cargo login` and `cargo publish`.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+`assets/diceware.txt` is the [EFF large wordlist](https://www.eff.org/dice) as shipped by
+KeePassXC, used under [CC BY 3.0 US](https://creativecommons.org/licenses/by/3.0/us/).
 
 ## Non-goals
 
