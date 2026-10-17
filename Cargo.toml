@@ -69,3 +69,9 @@ software-yubikey = []
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+
+# Debug builds and tests run real KDFs (Argon2, AES-KDF) on the test fixtures;
+# optimizing dependencies keeps the test suite fast. Crates that depend on
+# keepassxcr ignore this.
+[profile.dev.package."*"]
+opt-level = 3
