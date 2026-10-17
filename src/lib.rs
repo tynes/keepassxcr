@@ -8,3 +8,4 @@ pub mod format;
 pub mod model;
 pub mod util;
 pub mod xml;
+pub mod yubikey;

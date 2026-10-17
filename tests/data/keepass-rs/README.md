@@ -16,6 +16,7 @@ databases that use them.
 | `test_db_kdbx4_with_keyfile_v2*.kdbx` | `demopass` plus the `.keyx` file of the same name |
 | `test_db_kdbx3_with_chacha20_protected_fields.kdbx` | `password` |
 | `test_db_kdbx4_with_totp*.kdbx` | `test` |
+| `test_db_with_challenge_response_key.kdbx` | `demopass` plus a YubiKey HMAC-SHA1 slot with secret `0102030405060708090a0b0c0d0e0f1011121314`; used by `tests/yubikey.rs` and `tests/test_yubikey_compat.py` |
 | `broken_*.kdbx` | damaged on purpose; must fail to open |
 
 License of these files:

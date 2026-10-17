@@ -1,0 +1,42 @@
+diff --git a/src/keys/drivers/YubiKey.cpp b/src/keys/drivers/YubiKey.cpp
+index 35544b7..4d2dc44 100644
+--- a/src/keys/drivers/YubiKey.cpp
++++ b/src/keys/drivers/YubiKey.cpp
+@@ -17,6 +17,8 @@
+  */
+ 
+ #include "YubiKey.h"
++#include <QMessageAuthenticationCode>
++#include <QCryptographicHash>
+ #include "YubiKeyInterfacePCSC.h"
+ #include "YubiKeyInterfaceUSB.h"
+ 
+@@ -149,6 +151,28 @@ YubiKey::challenge(YubiKeySlot slot, const QByteArray& challenge, Botan::secure_
+ {
+     m_error.clear();
+ 
++    // TEST ONLY: software YubiKey. Pads exactly like the USB/PCSC drivers and
++    // strips trailing padding like a slot in variable-length HMAC mode.
++    if (qEnvironmentVariableIsSet("KPXC_TEST_YUBIKEY_SECRET")) {
++        QByteArray padded = challenge;
++        const int padLen = 64 - padded.size();
++        if (padLen > 0) {
++            padded.append(QByteArray(padLen, padLen));
++        }
++        if (qgetenv("KPXC_TEST_YUBIKEY_MODE") != "fixed") {
++            const char last = padded.at(63);
++            int len = 64;
++            while (len > 0 && padded.at(len - 1) == last) {
++                --len;
++            }
++            padded.truncate(len);
++        }
++        QByteArray secret = QByteArray::fromHex(qgetenv("KPXC_TEST_YUBIKEY_SECRET"));
++        QByteArray mac = QMessageAuthenticationCode::hash(padded, secret, QCryptographicHash::Sha1);
++        response.assign(mac.constData(), mac.constData() + mac.size());
++        return ChallengeResult::YCR_SUCCESS;
++    }
++
+     // Prevent re-entrant access to hardware keys
+     QMutexLocker lock(&s_interfaceMutex);
+ 

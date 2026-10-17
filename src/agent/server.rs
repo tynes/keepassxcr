@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -14,21 +13,27 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::agent::wire::{self, Location, Request, Response};
+use crate::agent::wire::{self, Location, Request, Response, Startup};
 use crate::agent::{ExpiredMarker, unix_now};
 use crate::crypto::sha256;
 use crate::error::{AppError, AppResult};
+use crate::util::unix::{current_uid, peer_uid};
+use crate::yubikey::YubiKeySlot;
 
-/// Transformed keys kept per agent. Each save adds one, reads reuse them.
+/// Transformed keys (and YubiKey results) kept per agent. Each save adds one,
+/// reads reuse them.
 const CACHE_LIMIT: usize = 16;
 /// How long a connected client may take to send its request.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct State {
+    /// Password and key-file components, joined but not yet hashed.
     key: Zeroizing<Vec<u8>>,
-    /// Transformed keys by hash of the KDF parameters, so repeated reads of an
-    /// unchanged file skip the KDF.
+    /// Transformed keys by hash of the KDF parameters and YubiKey result, so
+    /// repeated reads of an unchanged file skip the KDF.
     cache: HashMap<[u8; 32], Zeroizing<Vec<u8>>>,
+    /// YubiKey results by challenge, so reads of an unchanged file need no touch.
+    responses: HashMap<Vec<u8>, Zeroizing<[u8; 32]>>,
 }
 
 struct Agent {
@@ -41,10 +46,11 @@ struct Agent {
     /// Milliseconds after `started` of the last request. Kept outside `state`
     /// so the expiry watcher never waits for a request in progress.
     last_used_ms: AtomicU64,
+    yubikey: Option<YubiKeySlot>,
     state: Mutex<State>,
 }
 
-/// Run the agent for `database`. Reads the hex composite key from stdin,
+/// Run the agent for `database`. Reads its key and YubiKey slot from stdin,
 /// prints `ready` (or `error: ...`) on stdout, then serves until it expires.
 pub fn serve(database: &Path, idle: Duration, max: Duration) -> AppResult<()> {
     harden_process();
@@ -72,10 +78,9 @@ pub fn serve(database: &Path, idle: Duration, max: Duration) -> AppResult<()> {
 fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, UnixListener)> {
     let mut line = Zeroizing::new(String::new());
     io::stdin().lock().read_line(&mut line)?;
-    let key = Zeroizing::new(
-        hex::decode(line.trim_end())
-            .map_err(|_| AppError::InvalidInput("malformed key on stdin".to_string()))?,
-    );
+    let malformed = || AppError::InvalidInput("malformed key on stdin".to_string());
+    let startup: Startup = serde_json::from_str(&line).map_err(|_| malformed())?;
+    let key = Zeroizing::new(hex::decode(startup.key.as_bytes()).map_err(|_| malformed())?);
     lock_memory(&key);
 
     let location = Location::for_database(database)?;
@@ -93,9 +98,11 @@ fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, Un
         max,
         socket_inode,
         last_used_ms: AtomicU64::new(0),
+        yubikey: startup.yubikey,
         state: Mutex::new(State {
             key,
             cache: HashMap::new(),
+            responses: HashMap::new(),
         }),
     };
     Ok((agent, listener))
@@ -109,7 +116,7 @@ impl Agent {
     }
 
     fn handle(&self, mut stream: UnixStream) {
-        if peer_uid(&stream).ok() != Some(wire::current_uid()) {
+        if peer_uid(&stream).ok() != Some(current_uid()) {
             return;
         }
         if stream.set_read_timeout(Some(CLIENT_TIMEOUT)).is_err() {
@@ -121,7 +128,15 @@ impl Agent {
                 let _ = wire::write_message(&mut stream, &self.status());
                 self.shutdown(None);
             }
-            Ok(Request::Transform { kdf }) => self.transform(&kdf),
+            Ok(Request::Transform {
+                kdf,
+                challenge_response,
+            }) => self.transform(&kdf, challenge_response.as_ref().map(|hex| hex.as_str())),
+            Ok(Request::Recall { challenge }) => self.recall(&challenge),
+            Ok(Request::Remember {
+                challenge,
+                challenge_response,
+            }) => self.remember(&challenge, &challenge_response),
             Err(err) => Response {
                 error: Some(format!("bad request: {err}")),
                 ..Response::default()
@@ -136,14 +151,29 @@ impl Agent {
             database: Some(self.location.database.clone()),
             idle_left_secs: Some(idle_left.as_secs()),
             max_left_secs: Some(max_left.as_secs()),
+            yubikey: self.yubikey,
             ..Response::default()
         }
     }
 
-    fn transform(&self, kdf: &crate::crypto::KdfConfig) -> Response {
+    fn transform(
+        &self,
+        kdf: &crate::crypto::KdfConfig,
+        challenge_response: Option<&str>,
+    ) -> Response {
         self.touch();
+        let challenge_response = match challenge_response.map(decode_result).transpose() {
+            Ok(decoded) => decoded,
+            Err(err) => return error_response(err),
+        };
         let id = match serde_json::to_vec(kdf) {
-            Ok(encoded) => sha256(&encoded),
+            Ok(encoded) => {
+                let mut encoded = Zeroizing::new(encoded);
+                if let Some(response) = &challenge_response {
+                    encoded.extend_from_slice(&response[..]);
+                }
+                sha256(&encoded)
+            }
             Err(err) => return error_response(err.to_string()),
         };
         let cached = self.state().cache.get(&id).cloned();
@@ -152,9 +182,12 @@ impl Agent {
             None => {
                 // Run the KDF without holding the lock: it can take as long as
                 // the file's settings say, and expiry must not wait for it.
-                let key = self.state().key.clone();
-                lock_memory(&key);
-                let transformed = match kdf.transform(&key) {
+                let mut raw = Zeroizing::new(self.state().key.to_vec());
+                if let Some(response) = &challenge_response {
+                    raw.extend_from_slice(&response[..]);
+                }
+                lock_memory(&raw);
+                let transformed = match kdf.transform(&sha256(&raw)) {
                     Ok(transformed) => transformed,
                     Err(err) => return error_response(err.to_string()),
                 };
@@ -178,6 +211,41 @@ impl Agent {
     fn touch(&self) {
         let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_used_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn recall(&self, challenge: &str) -> Response {
+        self.touch();
+        let Ok(challenge) = hex::decode(challenge) else {
+            return error_response("malformed challenge".to_string());
+        };
+        let challenge_response = self
+            .state()
+            .responses
+            .get(&challenge)
+            .map(|response| Zeroizing::new(hex::encode(&response[..])));
+        Response {
+            database: Some(self.location.database.clone()),
+            challenge_response,
+            ..Response::default()
+        }
+    }
+
+    fn remember(&self, challenge: &str, challenge_response: &str) -> Response {
+        let (Ok(challenge), Ok(response)) =
+            (hex::decode(challenge), decode_result(challenge_response))
+        else {
+            return error_response("malformed YubiKey result".to_string());
+        };
+        lock_memory(&response[..]);
+        let mut state = self.state();
+        if state.responses.len() >= CACHE_LIMIT {
+            state.responses.clear();
+        }
+        state.responses.insert(challenge, response);
+        Response {
+            database: Some(self.location.database.clone()),
+            ..Response::default()
+        }
     }
 
     fn time_left(&self) -> (Duration, Duration) {
@@ -220,6 +288,7 @@ impl Agent {
         if let Ok(mut state) = self.state.try_lock() {
             state.key.iter_mut().for_each(|byte| *byte = 0);
             state.cache.clear();
+            state.responses.clear();
         }
         if self.owns_socket() {
             let _ = fs::remove_file(&self.location.socket);
@@ -229,6 +298,14 @@ impl Agent {
         }
         std::process::exit(0);
     }
+}
+
+/// Decode a hex SHA-256 YubiKey result.
+fn decode_result(encoded: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut decoded = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(encoded, &mut decoded[..])
+        .map_err(|_| "malformed YubiKey result".to_string())?;
+    Ok(decoded)
 }
 
 fn error_response(message: String) -> Response {
@@ -272,39 +349,4 @@ fn lock_memory(bytes: &[u8]) {
             libc::mlock(bytes.as_ptr().cast(), bytes.len());
         }
     }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: u32::MAX,
-        gid: u32::MAX,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: cred and len are valid for writes of the sizes passed.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut uid = u32::MAX;
-    let mut gid = u32::MAX;
-    // SAFETY: uid and gid are valid for writes.
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(uid)
 }

@@ -38,6 +38,13 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# YubiKey OTP interface: IOKit on macOS (opened shared), pure-Rust hidraw on Linux.
+hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev", "macos-shared-device"] }
+
+[features]
+# Testing only: KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch] replaces the
+# USB YubiKey with an emulated one. Never enable this for a build you use.
+software-yubikey = []
 
 [dev-dependencies]
 assert_cmd = "2.0"

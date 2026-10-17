@@ -1,3 +1,4 @@
 /target
 *.kdbx
 __pycache__/
+!tests/data/**/*.kdbx

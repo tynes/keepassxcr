@@ -5,6 +5,7 @@ use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 
 use crate::error::{AppError, AppResult};
+use crate::yubikey::YubiKeySlot;
 
 mod commands;
 mod interactive;
@@ -92,6 +93,9 @@ pub enum Command {
     Lock(LockArgs),
     /// Show whether a database is unlocked and for how long.
     Status(LockArgs),
+    /// Use a YubiKey plugged into another machine.
+    #[command(subcommand)]
+    Yubikey(YubiKeyCommand),
     /// Run the unlock agent (started by `unlock`).
     #[command(name = "__agent", hide = true)]
     Agent(AgentArgs),
@@ -111,9 +115,9 @@ pub struct CredentialArgs {
     /// Key file path.
     #[arg(long, value_name = "FILE")]
     pub key_file: Option<PathBuf>,
-    /// YubiKey challenge-response slot (1 or 2).
-    #[arg(long, value_name = "SLOT")]
-    pub yubikey: Option<u8>,
+    /// YubiKey challenge-response slot and optional serial (e.g. 2 or 2:7370001).
+    #[arg(short = 'y', long, value_name = "SLOT[:SERIAL]")]
+    pub yubikey: Option<YubiKeySlot>,
     /// Ignore the unlock agent and ask for credentials.
     #[arg(long)]
     pub no_agent: bool,
@@ -145,6 +149,25 @@ pub struct UnlockArgs {
 
     #[command(flatten)]
     pub credentials: CredentialArgs,
+}
+
+/// YubiKey subcommands.
+#[derive(Debug, Subcommand)]
+pub enum YubiKeyCommand {
+    /// Answer YubiKey challenges from a socket, e.g. forwarded with `ssh -R`.
+    ///
+    /// Run this where the YubiKey is plugged in. On the other machine
+    /// keepassxcr uses $KEEPASSXCR_YUBIKEY_SOCKET, or ~/.keepassxcr-yubikey.sock
+    /// when it exists, instead of USB.
+    Serve(YubiKeyServeArgs),
+}
+
+/// `yubikey serve` arguments.
+#[derive(Debug, Args)]
+pub struct YubiKeyServeArgs {
+    /// Socket to listen on [default: $KEEPASSXCR_YUBIKEY_SOCKET, else ~/.keepassxcr-yubikey.sock].
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 /// Lock and status arguments.
@@ -209,9 +232,12 @@ pub struct DbEditArgs {
     /// New key file.
     #[arg(long, value_name = "FILE")]
     pub new_key_file: Option<PathBuf>,
-    /// New YubiKey challenge-response slot (1 or 2).
-    #[arg(long, value_name = "SLOT")]
-    pub new_yubikey: Option<u8>,
+    /// New YubiKey challenge-response slot and optional serial (e.g. 2 or 2:7370001).
+    #[arg(long, value_name = "SLOT[:SERIAL]", conflicts_with = "unset_yubikey")]
+    pub new_yubikey: Option<YubiKeySlot>,
+    /// Stop requiring a YubiKey.
+    #[arg(long)]
+    pub unset_yubikey: bool,
 }
 
 /// Merge two databases.
@@ -233,6 +259,9 @@ pub struct MergeArgs {
     /// Source key file.
     #[arg(long, value_name = "FILE")]
     pub source_key_file: Option<PathBuf>,
+    /// YubiKey slot and optional serial for the source database.
+    #[arg(long = "yubikey-from", value_name = "SLOT[:SERIAL]")]
+    pub source_yubikey: Option<YubiKeySlot>,
 }
 
 /// Export database arguments.
@@ -541,13 +570,6 @@ impl CredentialArgs {
             return Err(AppError::InvalidInput(
                 "--no-password conflicts with --password".to_string(),
             ));
-        }
-        if let Some(slot) = self.yubikey {
-            if slot != 1 && slot != 2 {
-                return Err(AppError::InvalidInput(
-                    "--yubikey must be 1 or 2".to_string(),
-                ));
-            }
         }
         Ok(())
     }

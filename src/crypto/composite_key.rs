@@ -47,12 +47,28 @@ impl CompositeKey {
 
     /// Compute the raw composite key (SHA-256 of concatenated components).
     pub fn raw_key(&self) -> Zeroizing<Vec<u8>> {
+        self.raw_key_with(None)
+    }
+
+    /// Compute the raw composite key with a challenge-response result appended,
+    /// like KeePassXC's `CompositeKey::rawKey(transformSeed)` for KDBX 4.
+    pub fn raw_key_with(&self, challenge_response: Option<&[u8; 32]>) -> Zeroizing<Vec<u8>> {
+        let mut buffer = self.concatenated();
+        if let Some(response) = challenge_response {
+            buffer.extend_from_slice(response);
+        }
+        Zeroizing::new(sha256(&buffer).to_vec())
+    }
+
+    /// The components joined, before hashing. The unlock agent keeps this so it
+    /// can still append a YubiKey response.
+    pub fn concatenated(&self) -> Zeroizing<Vec<u8>> {
         let total_len: usize = self.parts.iter().map(|part| part.len()).sum();
-        let mut buffer = Zeroizing::new(Vec::with_capacity(total_len));
+        let mut buffer = Zeroizing::new(Vec::with_capacity(total_len + 32));
         for part in &self.parts {
             buffer.extend_from_slice(part);
         }
-        Zeroizing::new(sha256(&buffer).to_vec())
+        buffer
     }
 }
 
@@ -66,6 +82,20 @@ mod tests {
         key.add_component(vec![1, 2, 3]);
         let raw = key.raw_key();
         assert_eq!(raw.len(), 32);
+    }
+
+    #[test]
+    fn challenge_response_is_hashed_after_the_components() {
+        let mut key = CompositeKey::new();
+        key.add_component(vec![1, 2, 3]);
+        let response = [9u8; 32];
+        let mut expected = vec![1, 2, 3];
+        expected.extend_from_slice(&response);
+        assert_eq!(
+            *key.raw_key_with(Some(&response)),
+            sha256(&expected).to_vec()
+        );
+        assert_eq!(key.raw_key_with(None), key.raw_key());
     }
 
     #[test]

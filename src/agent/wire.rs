@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 use crate::agent::ExpiredMarker;
 use crate::crypto::{KdfConfig, sha256};
 use crate::error::{AppError, AppResult};
+use crate::util::unix::current_uid;
+use crate::yubikey::YubiKeySlot;
 
 /// Largest request or response line accepted.
 const MAX_LINE: u64 = 64 * 1024;
@@ -28,8 +30,30 @@ pub(super) enum Request {
     Status,
     /// Wipe the key and exit.
     Lock,
-    /// Run the KDF over the composite key. Resets the idle timer.
-    Transform { kdf: KdfConfig },
+    /// Run the KDF over the composite key, with a hex YubiKey result appended
+    /// first when given. Resets the idle timer.
+    Transform {
+        kdf: KdfConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        challenge_response: Option<Zeroizing<String>>,
+    },
+    /// Look up the remembered YubiKey result for a hex challenge. Resets the idle timer.
+    Recall { challenge: String },
+    /// Remember a YubiKey result (hex) for a hex challenge.
+    Remember {
+        challenge: String,
+        challenge_response: Zeroizing<String>,
+    },
+}
+
+/// What `unlock` hands a new agent on stdin, as one JSON line.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct Startup {
+    /// Hex of the password and key-file components, before hashing.
+    pub key: Zeroizing<String>,
+    /// YubiKey slot the database uses, if any.
+    #[serde(default)]
+    pub yubikey: Option<YubiKeySlot>,
 }
 
 /// The agent's reply. Fields are filled according to the request.
@@ -46,6 +70,11 @@ pub(super) struct Response {
     /// The transformed key in hex, wiped when dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transformed: Option<Zeroizing<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yubikey: Option<YubiKeySlot>,
+    /// A remembered YubiKey result in hex, wiped when dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_response: Option<Zeroizing<String>>,
 }
 
 /// Where one database's agent socket and expiry marker live.
@@ -153,9 +182,4 @@ pub(super) fn read_message<T: for<'de> Deserialize<'de>>(stream: &UnixStream) ->
         ));
     }
     serde_json::from_str(&line).map_err(io::Error::from)
-}
-
-pub(super) fn current_uid() -> u32 {
-    // SAFETY: getuid has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
 }
