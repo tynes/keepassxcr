@@ -60,7 +60,7 @@ fn parse_keyfile(data: &[u8]) -> AppResult<Vec<u8>> {
 /// Returns `Ok(None)` when the data is not an XML key file.
 fn parse_xml_keyfile(data: &[u8]) -> AppResult<Option<Vec<u8>>> {
     let mut reader = Reader::from_reader(data);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut in_version = false;
@@ -71,22 +71,21 @@ fn parse_xml_keyfile(data: &[u8]) -> AppResult<Option<Vec<u8>>> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Version" => in_version = true,
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"Data" => {
+            Ok(Event::Start(ref e)) if e.name().0 == "Version" => in_version = true,
+            Ok(Event::Start(ref e)) if e.name().0 == "Data" => {
                 in_data = true;
                 hash_attr = e
                     .attributes()
                     .flatten()
-                    .find(|attr| attr.key.as_ref() == b"Hash")
-                    .map(|attr| String::from_utf8_lossy(&attr.value).into_owned());
+                    .find(|attr| attr.key.0 == "Hash")
+                    .map(|attr| attr.value.into_owned());
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Version" => in_version = false,
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"Data" => in_data = false,
+            Ok(Event::End(ref e)) if e.name().0 == "Version" => in_version = false,
+            Ok(Event::End(ref e)) if e.name().0 == "Data" => in_data = false,
             Ok(Event::Text(e)) if in_version || in_data => {
-                let text = e
-                    .unescape()
-                    .map_err(|_| AppError::Crypto("invalid XML key file".to_string()))?
-                    .into_owned();
+                // Base64 and hex never contain entity references, so the
+                // text needs no unescaping.
+                let text = e.xml10_content().into_owned();
                 if in_version {
                     version = text;
                 } else {

@@ -227,7 +227,7 @@ fn write_marker(path: &Path, database: &Path, reason: &str) {
 
 /// Keep the key out of core dumps and, on Linux, away from ptrace and
 /// /proc/<pid>/mem by processes running as the same user.
-fn harden_process() {
+pub fn harden_process() {
     let no_core = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

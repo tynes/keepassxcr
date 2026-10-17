@@ -170,6 +170,18 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
     let header_end = cursor.position() as usize;
     let header_data = &data[..header_end];
 
+    // Check the header hash before running the KDF, so a corrupted header
+    // (for example a garbled rounds count) fails at once instead of running
+    // the KDF with junk parameters.
+    if version.is_kdbx4() {
+        let stored = data
+            .get(header_end..header_end + 32)
+            .ok_or_else(|| AppError::Format("truncated header hash".to_string()))?;
+        if stored != crate::crypto::sha256(header_data) {
+            return Err(AppError::Format("header hash mismatch".to_string()));
+        }
+    }
+
     if credentials.is_empty() {
         return Err(AppError::InvalidInput(
             "credentials required to decrypt database".to_string(),
@@ -420,12 +432,9 @@ fn read_kdbx4_payload(
     transformed: &[u8],
 ) -> AppResult<PayloadData> {
     let mut cursor = Cursor::new(data);
-    let header_hash = read_vec(&mut cursor, 32)?;
+    // The header hash was checked before the KDF ran.
+    let _header_hash = read_vec(&mut cursor, 32)?;
     let header_hmac = read_vec(&mut cursor, 32)?;
-
-    if header_hash != crate::crypto::sha256(header_data).to_vec() {
-        return Err(AppError::Format("header hash mismatch".to_string()));
-    }
 
     let hmac_key = kdbx_hmac_key(&header.master_seed, transformed);
     let header_key = hmac_block_key(u64::MAX, &hmac_key);
@@ -515,10 +524,7 @@ fn split_inner_header(payload: &[u8]) -> AppResult<(InnerHeader, Vec<u8>)> {
 }
 
 fn decompress_gzip(data: &[u8]) -> AppResult<Vec<u8>> {
-    let mut decoder = flate2::read::GzDecoder::new(data);
-    let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut out)?;
-    Ok(out)
+    crate::xml::gunzip_limited(data)
 }
 
 fn compress_gzip(data: &[u8]) -> AppResult<Vec<u8>> {
@@ -819,13 +825,18 @@ fn kdf_from_variant_map(map: &BTreeMap<String, VariantValue>) -> AppResult<KdfCo
                 _ => return Err(AppError::Format("missing Argon2 parallelism".to_string())),
             };
             let memory_kib = match map.get("M") {
-                Some(VariantValue::UInt64(val)) => (*val / 1024) as u32,
+                // Rejected rather than truncated: a truncated value would be
+                // written back on save and silently weaken the KDF.
+                Some(VariantValue::UInt64(val)) => u32::try_from(*val / 1024)
+                    .map_err(|_| AppError::Format("Argon2 memory out of range".to_string()))?,
                 _ => return Err(AppError::Format("missing Argon2 memory".to_string())),
             };
             let iterations = match map.get("I") {
-                Some(VariantValue::UInt64(val)) => *val as u32,
+                Some(VariantValue::UInt64(val)) => u32::try_from(*val)
+                    .map_err(|_| AppError::Format("Argon2 iterations out of range".to_string()))?,
                 _ => return Err(AppError::Format("missing Argon2 iterations".to_string())),
             };
+
             let salt = match map.get("S") {
                 Some(VariantValue::ByteArray(val)) => val.clone(),
                 _ => return Err(AppError::Format("missing Argon2 salt".to_string())),

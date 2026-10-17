@@ -1,4 +1,4 @@
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -231,11 +231,22 @@ fn argon2_kdf(
 
     let params = Params::new(memory_kib, iterations, parallelism, Some(32))
         .map_err(|err| AppError::Crypto(format!("invalid Argon2 params: {err}")))?;
+    // The memory size comes from the file. Allocate it fallibly so an
+    // impossible value is an error instead of an abort.
+    let block_count = params.block_count();
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(block_count).map_err(|_| {
+        AppError::Crypto(format!(
+            "cannot allocate {} MiB for Argon2",
+            memory_kib / 1024
+        ))
+    })?;
+    blocks.resize(block_count, Block::default());
     let argon2 = Argon2::new(alg, ver, params);
 
     let mut output = vec![0u8; 32];
     argon2
-        .hash_password_into(raw_key, salt, &mut output)
+        .hash_password_into_with_memory(raw_key, salt, &mut output, &mut blocks)
         .map_err(|err| AppError::Crypto(format!("argon2 failed: {err}")))?;
     Ok(output)
 }
@@ -277,5 +288,21 @@ mod tests {
         let raw_key = vec![3u8; 32];
         let out = kdf.transform(&raw_key).expect("argon2 should run");
         assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn impossible_argon2_memory_is_an_error() {
+        let kdf = KdfConfig::Argon2 {
+            kind: KdfType::Argon2id,
+            salt: vec![2u8; 32],
+            iterations: 1,
+            memory_kib: u32::MAX,
+            parallelism: 1,
+            version: 0x13,
+        };
+        let err = kdf
+            .transform(&[3u8; 32])
+            .expect_err("4 TiB cannot be allocated");
+        assert!(err.to_string().contains("cannot allocate"), "{err}");
     }
 }

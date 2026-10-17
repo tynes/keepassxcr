@@ -12,7 +12,7 @@ use std::io::{Cursor, Read};
 use base64::Engine as _;
 use quick_xml::Reader;
 use quick_xml::Writer;
-use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::{BytesEnd, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use secrecy::ExposeSecret;
 use time::OffsetDateTime;
@@ -50,14 +50,17 @@ pub fn read_database(
     protected_stream_key: &[u8],
     algo: ProtectedStreamAlgo,
 ) -> AppResult<Database> {
-    let mut reader = Reader::from_reader(xml);
+    let xml = std::str::from_utf8(xml).map_err(|_| AppError::Xml("invalid utf8".to_string()))?;
+    let mut reader = Reader::from_str(xml);
     // Values keep their leading and trailing whitespace, as in KeePassXC.
-    reader.trim_text(false);
+    reader.config_mut().trim_text(false);
     let mut parser = Parser {
         reader,
         input: xml,
         stream: ProtectedStream::new(algo, protected_stream_key)?,
         binaries: attachments.to_vec(),
+        meta_binaries: HashMap::new(),
+        depth: 0,
     };
     parser.parse_document()
 }
@@ -125,17 +128,52 @@ pub fn write_database(
 /// order, so a single parser walks the whole document once.
 struct Parser<'a> {
     reader: Reader<&'a [u8]>,
-    input: &'a [u8],
+    input: &'a str,
     stream: ProtectedStream,
+    /// KDBX4 inner-header attachment pool, indexed by position.
     binaries: Vec<Vec<u8>>,
+    /// KDBX3 `Meta/Binaries` pool, keyed by the `ID` attribute.
+    ///
+    /// A map rather than a vector so that a huge `ID` from the file cannot
+    /// cause a huge allocation.
+    meta_binaries: HashMap<usize, Vec<u8>>,
+    /// Current `Group`/`Entry` nesting depth.
+    depth: usize,
+}
+
+/// Deepest `Group`/`History` nesting accepted when parsing.
+///
+/// Parsing recurses per level, so an unbounded depth from a hostile file would
+/// overflow the stack. Real databases are nowhere near this.
+const MAX_DEPTH: usize = 256;
+
+/// Largest decompressed size accepted for the payload or one attachment.
+///
+/// KeePassXC 2.7 keeps these in a `QByteArray`, which cannot exceed 2 GiB, so
+/// nothing KeePassXC writes is larger. The limit stops a small compressed file
+/// from expanding into many gigabytes of memory.
+pub const MAX_DECOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Gunzip `data`, failing instead of growing past [`MAX_DECOMPRESSED_SIZE`].
+pub fn gunzip_limited(data: &[u8]) -> AppResult<Vec<u8>> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(data)
+        .take(MAX_DECOMPRESSED_SIZE + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_SIZE {
+        return Err(AppError::Format(
+            "decompressed data is larger than 2 GiB".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// One child event of an element being parsed.
 enum Child {
     /// A start tag with its name and attributes (owned so the reader can advance).
-    Start(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, usize),
+    Start(String, Vec<(String, String)>, usize),
     /// A self-closing tag.
-    Empty(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, usize),
+    Empty(String, Vec<(String, String)>, usize),
     /// The end tag of the parent element.
     End,
 }
@@ -146,10 +184,10 @@ impl<'a> Parser<'a> {
         let mut root_group = None;
         loop {
             match self.reader.read_event() {
-                Ok(Event::Start(e)) if e.name().as_ref() == b"Meta" => {
+                Ok(Event::Start(e)) if e.name().0 == "Meta" => {
                     self.parse_meta(&mut database)?;
                 }
-                Ok(Event::Start(e)) if e.name().as_ref() == b"Root" => {
+                Ok(Event::Start(e)) if e.name().0 == "Root" => {
                     root_group = Some(self.parse_root(&mut database)?);
                 }
                 Ok(Event::Eof) => break,
@@ -166,21 +204,13 @@ impl<'a> Parser<'a> {
     /// Read the next child event of the current element.
     fn next_child(&mut self) -> AppResult<Child> {
         loop {
-            let start_pos = self.reader.buffer_position();
+            let start_pos = self.reader.buffer_position() as usize;
             match self.reader.read_event() {
                 Ok(Event::Start(e)) => {
-                    return Ok(Child::Start(
-                        e.name().as_ref().to_vec(),
-                        attrs(&e),
-                        start_pos,
-                    ));
+                    return Ok(Child::Start(e.name().0.to_string(), attrs(&e), start_pos));
                 }
                 Ok(Event::Empty(e)) => {
-                    return Ok(Child::Empty(
-                        e.name().as_ref().to_vec(),
-                        attrs(&e),
-                        start_pos,
-                    ));
+                    return Ok(Child::Empty(e.name().0.to_string(), attrs(&e), start_pos));
                 }
                 Ok(Event::End(_)) | Ok(Event::Eof) => return Ok(Child::End),
                 Err(err) => return Err(AppError::Xml(format!("xml parse error: {err}"))),
@@ -190,7 +220,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Skip the rest of an element whose start tag was just read and return it verbatim.
-    fn capture(&mut self, name: &[u8], start_pos: usize) -> AppResult<RawElement> {
+    fn capture(&mut self, name: &str, start_pos: usize) -> AppResult<RawElement> {
         self.reader
             .read_to_end(QName(name))
             .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
@@ -198,13 +228,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Return the source text from `start_pos` to the reader position as a raw element.
-    fn raw_since(&self, name: &[u8], start_pos: usize) -> AppResult<RawElement> {
-        let end_pos = self.reader.buffer_position();
-        let xml = std::str::from_utf8(&self.input[start_pos..end_pos])
-            .map_err(|_| AppError::Xml("invalid utf8".to_string()))?
+    fn raw_since(&self, name: &str, start_pos: usize) -> AppResult<RawElement> {
+        let end_pos = self.reader.buffer_position() as usize;
+        let xml = self
+            .input
+            .get(start_pos..end_pos)
+            .ok_or_else(|| AppError::Xml("invalid element bounds".to_string()))?
             .trim()
             .to_string();
-        Ok(RawElement::new(utf8(name)?, xml))
+        Ok(RawElement::new(name.to_string(), xml))
     }
 
     /// Read the text content of a leaf element whose start tag was just read.
@@ -212,20 +244,14 @@ impl<'a> Parser<'a> {
         let mut text = String::new();
         loop {
             match self.reader.read_event() {
-                Ok(Event::Text(e)) => {
-                    text.push_str(
-                        &e.unescape()
-                            .map_err(|_| AppError::Xml("invalid text".to_string()))?,
-                    );
-                }
-                Ok(Event::CData(e)) => {
-                    text.push_str(&utf8(&e.into_inner())?);
-                }
+                Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+                Ok(Event::GeneralRef(e)) => text.push(resolve_reference(&e)?),
+                Ok(Event::CData(e)) => text.push_str(&e.into_inner()),
                 Ok(Event::End(_)) | Ok(Event::Eof) => break,
                 Ok(Event::Start(e)) => {
-                    let name = e.name().as_ref().to_vec();
+                    let name = e.name().0.to_string();
                     self.reader
-                        .read_to_end(QName(&name))
+                        .read_to_end(QName(name.as_str()))
                         .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
                 }
                 Err(err) => return Err(AppError::Xml(format!("xml text error: {err}"))),
@@ -239,29 +265,29 @@ impl<'a> Parser<'a> {
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, _, pos) => match name.as_slice() {
-                    b"DatabaseName" => {
+                Child::Start(name, _, pos) => match name.as_str() {
+                    "DatabaseName" => {
                         let value = self.read_text()?;
                         database.meta_mut().set_name(value);
                     }
-                    b"DatabaseDescription" => {
+                    "DatabaseDescription" => {
                         let value = self.read_text()?;
                         database.meta_mut().set_description(value);
                     }
                     // Regenerated on write.
-                    b"Generator" | b"HeaderHash" => {
+                    "Generator" | "HeaderHash" => {
                         self.read_text()?;
                     }
-                    b"Binaries" => self.parse_meta_binaries()?,
+                    "Binaries" => self.parse_meta_binaries()?,
                     _ => {
                         let raw = self.capture(&name, pos)?;
                         database.meta_mut().extra_mut().push(raw);
                     }
                 },
-                Child::Empty(name, _, pos) => match name.as_slice() {
-                    b"DatabaseName" => database.meta_mut().set_name(String::new()),
-                    b"DatabaseDescription" => database.meta_mut().set_description(String::new()),
-                    b"Generator" | b"HeaderHash" | b"Binaries" => {}
+                Child::Empty(name, _, pos) => match name.as_str() {
+                    "DatabaseName" => database.meta_mut().set_name(String::new()),
+                    "DatabaseDescription" => database.meta_mut().set_description(String::new()),
+                    "Generator" | "HeaderHash" | "Binaries" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         database.meta_mut().extra_mut().push(raw);
@@ -277,39 +303,35 @@ impl<'a> Parser<'a> {
         loop {
             let (attributes, data) = match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, attributes, _) if name.as_slice() == b"Binary" => {
+                Child::Start(name, attributes, _) if name == "Binary" => {
                     (attributes, self.read_text()?)
                 }
-                Child::Empty(name, attributes, _) if name.as_slice() == b"Binary" => {
+                Child::Empty(name, attributes, _) if name == "Binary" => {
                     (attributes, String::new())
                 }
                 Child::Start(name, _, _) => {
                     self.reader
-                        .read_to_end(QName(&name))
+                        .read_to_end(QName(name.as_str()))
                         .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
                     continue;
                 }
                 Child::Empty(..) => continue,
             };
 
-            let id = attr(&attributes, b"ID")
+            let id = attr(&attributes, "ID")
                 .ok_or_else(|| AppError::Xml("binary without ID".to_string()))?
                 .parse::<usize>()
                 .map_err(|_| AppError::Xml("invalid binary ID".to_string()))?;
             let mut bytes = decode_base64(&data, "binary")?;
-            if attr(&attributes, b"Protected").as_deref() == Some("True") {
+            if attr(&attributes, "Protected").as_deref() == Some("True") {
                 self.stream.apply(&mut bytes)?;
             }
-            if attr(&attributes, b"Compressed").as_deref() == Some("True") {
-                let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out)?;
-                bytes = out;
+            // KeePassXC writes an empty attachment as `<Binary ID="n" Compressed="True"/>`
+            // with no gzip data at all.
+            if attr(&attributes, "Compressed").as_deref() == Some("True") && !bytes.is_empty() {
+                bytes = gunzip_limited(&bytes)?;
             }
-            if self.binaries.len() <= id {
-                self.binaries.resize(id + 1, Vec::new());
-            }
-            self.binaries[id] = bytes;
+            self.meta_binaries.insert(id, bytes);
         }
         Ok(())
     }
@@ -319,7 +341,7 @@ impl<'a> Parser<'a> {
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, _, _) if name.as_slice() == b"Group" && root_group.is_none() => {
+                Child::Start(name, _, _) if name == "Group" && root_group.is_none() => {
                     root_group = Some(self.parse_group()?);
                 }
                 Child::Start(name, _, pos) => {
@@ -335,23 +357,39 @@ impl<'a> Parser<'a> {
         root_group.ok_or_else(|| AppError::Xml("missing root group".to_string()))
     }
 
+    /// Enter one nesting level, failing past [`MAX_DEPTH`].
+    fn descend(&mut self) -> AppResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(AppError::Xml("groups are nested too deeply".to_string()));
+        }
+        Ok(())
+    }
+
     fn parse_group(&mut self) -> AppResult<Group> {
+        self.descend()?;
+        let group = self.parse_group_body();
+        self.depth -= 1;
+        group
+    }
+
+    fn parse_group_body(&mut self) -> AppResult<Group> {
         let mut group = Group::new("Group".to_string());
         let mut uuid = None;
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, _, pos) => match name.as_slice() {
-                    b"UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
-                    b"Name" => {
+                Child::Start(name, _, pos) => match name.as_str() {
+                    "UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    "Name" => {
                         let value = self.read_text()?;
                         group.set_name(value);
                     }
-                    b"Entry" => {
+                    "Entry" => {
                         let entry = self.parse_entry()?;
                         group.entries_mut().push(entry);
                     }
-                    b"Group" => {
+                    "Group" => {
                         let child = self.parse_group()?;
                         group.groups_mut().push(child);
                     }
@@ -360,9 +398,9 @@ impl<'a> Parser<'a> {
                         group.extra_mut().push(raw);
                     }
                 },
-                Child::Empty(name, _, pos) => match name.as_slice() {
-                    b"Name" => group.set_name(String::new()),
-                    b"UUID" | b"Entry" | b"Group" => {}
+                Child::Empty(name, _, pos) => match name.as_str() {
+                    "Name" => group.set_name(String::new()),
+                    "UUID" | "Entry" | "Group" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         group.extra_mut().push(raw);
@@ -377,14 +415,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entry(&mut self) -> AppResult<Entry> {
+        self.descend()?;
+        let entry = self.parse_entry_body();
+        self.depth -= 1;
+        entry
+    }
+
+    fn parse_entry_body(&mut self) -> AppResult<Entry> {
         let mut uuid = None;
         let mut entry = Entry::new(String::new());
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, _, pos) => match name.as_slice() {
-                    b"UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
-                    b"String" => {
+                Child::Start(name, _, pos) => match name.as_str() {
+                    "UUID" => uuid = Some(parse_uuid(&self.read_text()?)?),
+                    "String" => {
                         let (key, value, protected) = self.parse_string()?;
                         match key.as_str() {
                             "Title" => entry.set_title(value),
@@ -395,19 +440,19 @@ impl<'a> Parser<'a> {
                             _ => entry.set_custom_field(key, value, protected),
                         }
                     }
-                    b"Binary" => {
+                    "Binary" => {
                         if let Some(attachment) = self.parse_binary()? {
                             entry.attachments_mut().push(attachment);
                         }
                     }
-                    b"History" => self.parse_history(&mut entry)?,
+                    "History" => self.parse_history(&mut entry)?,
                     _ => {
                         let raw = self.capture(&name, pos)?;
                         entry.extra_mut().push(raw);
                     }
                 },
-                Child::Empty(name, _, pos) => match name.as_slice() {
-                    b"UUID" | b"String" | b"Binary" | b"History" => {}
+                Child::Empty(name, _, pos) => match name.as_str() {
+                    "UUID" | "String" | "Binary" | "History" => {}
                     _ => {
                         let raw = self.raw_since(&name, pos)?;
                         entry.extra_mut().push(raw);
@@ -425,13 +470,13 @@ impl<'a> Parser<'a> {
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, _, _) if name.as_slice() == b"Entry" => {
+                Child::Start(name, _, _) if name == "Entry" => {
                     let item = self.parse_entry()?;
                     entry.history_mut().push(item);
                 }
                 Child::Start(name, _, _) => {
                     self.reader
-                        .read_to_end(QName(&name))
+                        .read_to_end(QName(name.as_str()))
                         .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
                 }
                 Child::Empty(..) => {}
@@ -447,13 +492,13 @@ impl<'a> Parser<'a> {
         loop {
             match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, attributes, _) => match name.as_slice() {
-                    b"Key" => key = self.read_text()?,
-                    b"Value" => {
+                Child::Start(name, attributes, _) => match name.as_str() {
+                    "Key" => key = self.read_text()?,
+                    "Value" => {
                         let is_protected =
-                            attr(&attributes, b"Protected").as_deref() == Some("True");
+                            attr(&attributes, "Protected").as_deref() == Some("True");
                         let in_memory =
-                            attr(&attributes, b"ProtectInMemory").as_deref() == Some("True");
+                            attr(&attributes, "ProtectInMemory").as_deref() == Some("True");
                         protected = is_protected || in_memory;
                         let raw = self.read_text()?;
                         value = if is_protected {
@@ -467,14 +512,14 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         self.reader
-                            .read_to_end(QName(&name))
+                            .read_to_end(QName(name.as_str()))
                             .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
                     }
                 },
                 Child::Empty(name, attributes, _) => {
-                    if name.as_slice() == b"Value" {
-                        protected = attr(&attributes, b"Protected").as_deref() == Some("True")
-                            || attr(&attributes, b"ProtectInMemory").as_deref() == Some("True");
+                    if name == "Value" {
+                        protected = attr(&attributes, "Protected").as_deref() == Some("True")
+                            || attr(&attributes, "ProtectInMemory").as_deref() == Some("True");
                         value.clear();
                     }
                 }
@@ -490,16 +535,16 @@ impl<'a> Parser<'a> {
         loop {
             let attributes = match self.next_child()? {
                 Child::End => break,
-                Child::Start(name, attributes, _) => match name.as_slice() {
-                    b"Key" => {
+                Child::Start(name, attributes, _) => match name.as_str() {
+                    "Key" => {
                         key = Some(self.read_text()?);
                         continue;
                     }
-                    b"Value" => {
+                    "Value" => {
                         let raw = self.read_text()?;
                         if !raw.is_empty() {
                             let mut bytes = decode_base64(&raw, "attachment")?;
-                            if attr(&attributes, b"Protected").as_deref() == Some("True") {
+                            if attr(&attributes, "Protected").as_deref() == Some("True") {
                                 self.stream.apply(&mut bytes)?;
                             }
                             value = Some(bytes);
@@ -508,15 +553,15 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         self.reader
-                            .read_to_end(QName(&name))
+                            .read_to_end(QName(name.as_str()))
                             .map_err(|err| AppError::Xml(format!("xml parse error: {err}")))?;
                         continue;
                     }
                 },
-                Child::Empty(name, attributes, _) if name.as_slice() == b"Value" => attributes,
+                Child::Empty(name, attributes, _) if name == "Value" => attributes,
                 Child::Empty(..) => continue,
             };
-            if let Some(index) = attr(&attributes, b"Ref") {
+            if let Some(index) = attr(&attributes, "Ref") {
                 ref_index = Some(
                     index
                         .parse::<usize>()
@@ -533,6 +578,7 @@ impl<'a> Parser<'a> {
             (Some(index), _) => self
                 .binaries
                 .get(index)
+                .or_else(|| self.meta_binaries.get(&index))
                 .cloned()
                 .ok_or_else(|| AppError::Xml("attachment ref out of bounds".to_string()))?,
             (None, Some(data)) => data,
@@ -542,23 +588,37 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn attrs(element: &BytesStart) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn attrs(element: &BytesStart) -> Vec<(String, String)> {
     element
         .attributes()
         .flatten()
-        .map(|attribute| (attribute.key.as_ref().to_vec(), attribute.value.to_vec()))
+        .map(|attribute| (attribute.key.0.to_string(), attribute.value.into_owned()))
         .collect()
 }
 
-fn attr(attributes: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<String> {
+fn attr(attributes: &[(String, String)], key: &str) -> Option<String> {
     attributes
         .iter()
-        .find(|(name, _)| name.as_slice() == key)
-        .and_then(|(_, value)| String::from_utf8(value.clone()).ok())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
 }
 
-fn utf8(bytes: &[u8]) -> AppResult<String> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| AppError::Xml("invalid utf8".to_string()))
+/// Resolve an entity or character reference (`&amp;`, `&#13;`) in text.
+fn resolve_reference(reference: &BytesRef) -> AppResult<char> {
+    if let Some(ch) = reference
+        .resolve_char_ref()
+        .map_err(|_| AppError::Xml("invalid character reference".to_string()))?
+    {
+        return Ok(ch);
+    }
+    match &*reference.xml10_content() {
+        "lt" => Ok('<'),
+        "gt" => Ok('>'),
+        "amp" => Ok('&'),
+        "apos" => Ok('\''),
+        "quot" => Ok('"'),
+        other => Err(AppError::Xml(format!("unknown entity &{other};"))),
+    }
 }
 
 fn decode_base64(text: &str, what: &str) -> AppResult<Vec<u8>> {
@@ -607,7 +667,7 @@ fn build_attachment_pool(root: &Group) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, usize>
     (pool, index)
 }
 
-fn xml_write_error(err: quick_xml::Error) -> AppError {
+fn xml_write_error(err: std::io::Error) -> AppError {
     AppError::Xml(format!("xml write error: {err}"))
 }
 
@@ -988,6 +1048,64 @@ mod tests {
             entry.custom_fields().get("Empty").map(String::as_str),
             Some("")
         );
+    }
+
+    fn parse(xml: &str) -> AppResult<Database> {
+        read_database(xml.as_bytes(), &[], &KEY, ProtectedStreamAlgo::Salsa20)
+    }
+
+    #[test]
+    fn huge_binary_ids_do_not_panic_or_allocate() {
+        for id in ["18446744073709551615", "200000000000", "40000000"] {
+            let xml = format!(
+                "<KeePassFile><Meta><Binaries><Binary ID=\"{id}\">aGk=</Binary></Binaries></Meta>\
+                 <Root><Group><Name>R</Name><Entry><Binary><Key>a</Key><Value Ref=\"{id}\"/></Binary>\
+                 </Entry></Group></Root></KeePassFile>"
+            );
+            let db = parse(&xml).expect("parse");
+            assert_eq!(db.root().entries()[0].attachments()[0].data(), b"hi");
+        }
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_stack_overflow() {
+        let depth = 200_000;
+        let xml = format!(
+            "<KeePassFile><Root>{}{}</Root></KeePassFile>",
+            "<Group>".repeat(depth),
+            "</Group>".repeat(depth)
+        );
+        let err = parse(&xml).expect_err("too deep");
+        assert!(err.to_string().contains("nested too deeply"), "{err}");
+
+        let ok = format!(
+            "<KeePassFile><Root>{}{}</Root></KeePassFile>",
+            "<Group>".repeat(MAX_DEPTH),
+            "</Group>".repeat(MAX_DEPTH)
+        );
+        parse(&ok).expect("deep but allowed");
+    }
+
+    #[test]
+    fn many_attributes_parse_quickly() {
+        // quick-xml before 0.41 checked duplicate attributes in quadratic time
+        // (RUSTSEC-2026-0194).
+        let attributes: String = (0..60_000).map(|i| format!(" a{i}=\"x\"")).collect();
+        let xml = format!(
+            "<KeePassFile><Root><Group{attributes}><Name>R</Name></Group></Root></KeePassFile>"
+        );
+        let started = std::time::Instant::now();
+        parse(&xml).expect("parse");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn references_are_resolved_in_text() {
+        let db = parse(
+            "<KeePassFile><Root><Group><Name>a &amp; b &lt;c&gt; &#65;&#x42;</Name></Group></Root></KeePassFile>",
+        )
+        .expect("parse");
+        assert_eq!(db.root().name(), "a & b <c> AB");
     }
 
     #[test]

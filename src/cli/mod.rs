@@ -11,6 +11,9 @@ mod interactive;
 
 /// Run the keepassxcr CLI.
 pub fn run() -> anyhow::Result<()> {
+    // Decrypted data must never end up in a core dump, even if parsing a
+    // hostile file crashes the process.
+    crate::agent::harden_process();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     commands::dispatch(cli).context("command failed")
