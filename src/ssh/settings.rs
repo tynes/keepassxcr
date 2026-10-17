@@ -267,14 +267,16 @@ fn escape(value: &str) -> String {
 /// Decode UTF-16 (with or without a BOM) or UTF-8.
 fn decode_text(data: &[u8]) -> AppResult<String> {
     let utf16 = |bytes: &[u8], little: bool| -> AppResult<String> {
-        if !bytes.len().is_multiple_of(2) {
+        // `as_chunks` splits into 2-byte arrays plus any odd byte left over.
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        if !rest.is_empty() {
             return Err(invalid("KeeAgent settings are not valid UTF-16"));
         }
-        let units = bytes.chunks_exact(2).map(|pair| {
+        let units = pairs.iter().map(|&pair| {
             if little {
-                u16::from_le_bytes([pair[0], pair[1]])
+                u16::from_le_bytes(pair)
             } else {
-                u16::from_be_bytes([pair[0], pair[1]])
+                u16::from_be_bytes(pair)
             }
         });
         char::decode_utf16(units)
