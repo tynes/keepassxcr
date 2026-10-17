@@ -59,6 +59,10 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
         }
         Command::AttachmentRm(args) => attachment_remove(args).context("attachment-rm failed"),
         Command::Clip(args) => clip(args).context("clip failed"),
+        Command::SshAdd(args) => crate::cli::ssh::ssh_add(args).context("ssh-add failed"),
+        Command::SshKeyImport(args) => {
+            crate::cli::ssh::ssh_key_import(args).context("ssh-key-import failed")
+        }
         Command::Analyze(args) => analyze(args).context("analyze failed"),
         Command::Estimate(args) => estimate(args).context("estimate failed"),
         Command::Generate(args) => generate(args).context("generate failed"),
@@ -700,25 +704,33 @@ fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
     // agent. Opening through the agent also leaves it the YubiKey's answer
     // for the current seed, so reads need no touch.
     let through_agent = agent::credentials_for(&args.database)?;
-    let opened = match through_agent {
+    let opened = match &through_agent {
         Some(key) => read_kdbx(
             &args.database,
             &Credentials {
                 password: None,
                 key_file: None,
                 yubikey: None,
-                agent: Some(key),
+                agent: Some(key.clone()),
             },
         ),
         None => Err(AppError::InvalidInput(
             "agent started but does not answer".to_string(),
         )),
     };
-    if let Err(err) = opened {
-        agent::lock(Some(&args.database))?;
-        return Err(err.into());
-    }
+    let file = match opened {
+        Ok(file) => file,
+        Err(err) => {
+            agent::lock(Some(&args.database))?;
+            return Err(err.into());
+        }
+    };
     println!("Unlocked {}", describe_unlocked(&status));
+    if args.ssh_add
+        && let Some(key) = &through_agent
+    {
+        crate::cli::ssh::add_on_unlock(&file, &args.database, key, status.max_left)?;
+    }
     Ok(())
 }
 
@@ -988,7 +1000,7 @@ fn database_name_from_path(path: &Path) -> String {
         .to_string()
 }
 
-fn load_database(
+pub(super) fn load_database(
     path: &Path,
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<(KdbxFile, Credentials)> {

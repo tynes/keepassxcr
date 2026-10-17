@@ -51,6 +51,8 @@ struct Agent {
     busy: AtomicUsize,
     yubikey: Option<YubiKeySlot>,
     state: Mutex<State>,
+    /// SSH keys to remove from ssh-agent on lock: (ssh-agent socket, public blob).
+    ssh_keys: Mutex<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 /// Run the agent for `database`. Reads its key and YubiKey slot from stdin,
@@ -108,6 +110,7 @@ fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, Un
             cache: HashMap::new(),
             responses: HashMap::new(),
         }),
+        ssh_keys: Mutex::new(Vec::new()),
     };
     Ok((agent, listener))
 }
@@ -147,6 +150,8 @@ impl Agent {
         let response = match wire::read_message::<Request>(&stream) {
             Ok(Request::Status) => self.status(),
             Ok(Request::Lock) => {
+                // Before answering, so the keys are gone when `lock` returns.
+                self.remove_ssh_keys();
                 let _ = wire::write_message(&mut stream, &self.status());
                 self.shutdown(None);
             }
@@ -159,6 +164,9 @@ impl Agent {
                 challenge,
                 challenge_response,
             }) => self.remember(&challenge, &challenge_response),
+            Ok(Request::TrackSshKey { socket, public_key }) => {
+                self.track_ssh_key(socket, &public_key)
+            }
             Err(err) => Response {
                 error: Some(format!("bad request: {err}")),
                 ..Response::default()
@@ -271,6 +279,40 @@ impl Agent {
         }
     }
 
+    fn track_ssh_key(&self, socket: PathBuf, public_key: &str) -> Response {
+        let Ok(blob) = hex::decode(public_key) else {
+            return error_response("malformed SSH public key".to_string());
+        };
+        let mut keys = self
+            .ssh_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !keys
+            .iter()
+            .any(|(known_socket, known)| *known_socket == socket && *known == blob)
+        {
+            keys.push((socket, blob));
+        }
+        Response {
+            database: Some(self.location.database.clone()),
+            ..Response::default()
+        }
+    }
+
+    /// Remove the tracked keys from ssh-agent. Best effort: an ssh-agent that
+    /// is gone has forgotten them anyway.
+    fn remove_ssh_keys(&self) {
+        let keys = std::mem::take(
+            &mut *self
+                .ssh_keys
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for (socket, blob) in keys {
+            let _ = crate::ssh::agent::SshAgent::at(socket).remove(&blob);
+        }
+    }
+
     fn time_left(&self) -> (Duration, Duration) {
         let now = Instant::now();
         let last_used =
@@ -308,6 +350,7 @@ impl Agent {
     /// Never waits for a request in progress: if one holds the state, the key
     /// is wiped by the process exiting instead.
     fn shutdown(&self, reason: Option<&str>) -> ! {
+        self.remove_ssh_keys();
         if let Ok(mut state) = self.state.try_lock() {
             state.key.iter_mut().for_each(|byte| *byte = 0);
             state.cache.clear();

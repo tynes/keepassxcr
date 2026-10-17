@@ -9,7 +9,7 @@ writing KeePass databases.
 - Reads and writes **KDBX 3.1** and **KDBX 4.x** databases
 - CLI-compatible with `keepassxc-cli`
 - Pure Rust cryptography (no C bindings)
-- v0.2.0 — early development; keep a backup of any database you use it on
+- v0.3.0 — early development; keep a backup of any database you use it on
 
 ## Install
 
@@ -203,6 +203,37 @@ leftover socket from an earlier connection makes `ssh -R` fail to bind; add
 connected, anyone with root on the server can send challenges to your key, as with ssh-agent
 forwarding; a slot set up with `--touch` still needs your finger for each one.
 
+### SSH keys
+
+keepassxcr loads SSH keys stored in entries into your ssh-agent, using the same settings as
+KeePassXC's SSH agent integration (a `KeeAgent.settings` attachment), so an entry set up in the
+KeePassXC app works here and the reverse. The private key is an attachment on the entry, or a
+file the settings point at, and the entry's password is the key's passphrase. keepassxc-cli has
+no equivalent; in KeePassXC this only happens in the app.
+
+```sh
+keepassxcr add -p passwords.kdbx SSH/GitHub                 # password = the key's passphrase
+keepassxcr ssh-key-import passwords.kdbx SSH/GitHub ~/.ssh/id_ed25519
+keepassxcr ssh-add passwords.kdbx SSH/GitHub                # load one key
+keepassxcr ssh-add passwords.kdbx --all                     # what KeePassXC loads on unlock
+keepassxcr ssh-add -l passwords.kdbx                        # entries with keys, loaded or not
+keepassxcr ssh-add -d passwords.kdbx --all                  # remove them again
+keepassxcr unlock --ssh-add passwords.kdbx                  # unlock and load in one step
+```
+
+`ssh-key-import` checks that the entry's password opens the key, then stores it with settings
+that add it on unlock and remove it on lock; `--no-add-on-unlock`, `--keep-on-lock`,
+`--lifetime 1h` and `--confirm` change them. `ssh-add -t 30m` and `-c` override an entry's
+lifetime and confirmation for one call.
+
+While the database is unlocked with `unlock`, every key `ssh-add` loads gets an ssh-agent
+lifetime no longer than the unlock session has left, and keys set to "remove on lock" are
+removed by `lock` and when the session times out. Without an unlock session a key stays in
+ssh-agent until you remove it or its own lifetime runs out. Keys go to the agent in
+`SSH_AUTH_SOCK`; once loaded, ssh-agent holds the decrypted key, and agent forwarding
+(`ssh -A`) works as usual. Only OpenSSH-format private keys are read (the default since OpenSSH
+7.8); convert an older PEM key with `ssh-keygen -p -f <file>`.
+
 ## Command reference
 
 | Category | Command | Description |
@@ -231,8 +262,10 @@ forwarding; a slot set up with `--touch` still needs your finger for each one.
 | | `diceware` | Generate a diceware passphrase |
 | | `estimate` | Estimate password strength |
 | | `analyze` | Analyze passwords with offline HIBP data |
+| **SSH keys** | `ssh-add` | Load SSH keys from entries into ssh-agent (`-l` list, `-d` remove, `--all`) |
+| | `ssh-key-import` | Store an SSH private key in an entry, set up like KeePassXC's SSH agent tab |
 | **YubiKey** | `yubikey serve` | Answer YubiKey challenges forwarded from another machine |
-| **Unlock agent** | `unlock` | Keep a database unlocked in a background agent |
+| **Unlock agent** | `unlock` | Keep a database unlocked in a background agent (`--ssh-add` also loads SSH keys) |
 | | `lock` | Stop the agent for a database, or all of them |
 | | `status` | Show whether a database is unlocked and for how long |
 
@@ -263,6 +296,7 @@ src/
 ├── cli/
 │   ├── mod.rs           CLI definition (clap derive)
 │   ├── commands.rs      Subcommand dispatch and handlers
+│   ├── ssh.rs           ssh-add, ssh-key-import, unlock --ssh-add
 │   └── interactive.rs   Interactive REPL (open command)
 ├── crypto/
 │   ├── mod.rs           Crypto module root
@@ -284,6 +318,11 @@ src/
 │   └── mod.rs           Database, Group, Entry data model
 ├── xml/
 │   └── mod.rs           KeePass XML serialization/deserialization
+├── ssh/
+│   ├── mod.rs           Entries with SSH keys
+│   ├── settings.rs      KeeAgent.settings (KeePassXC's SSH agent settings)
+│   ├── key.rs           Read and decrypt an entry's OpenSSH private key
+│   └── agent.rs         ssh-agent protocol client (add, remove, list)
 ├── yubikey/
 │   ├── mod.rs           Slot parsing, KeePassXC-style padding, picking a backend
 │   ├── otp.rs           YubiKey OTP HID protocol (frames, CRC, touch polling)
@@ -309,6 +348,9 @@ cargo test --features software-yubikey
 The `software-yubikey` feature replaces the USB YubiKey with an emulated one
 (`KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch]`) so the YubiKey tests in
 `tests/yubikey.rs` run without hardware. It is for tests only; never build a binary you use with it.
+
+`tests/ssh.rs` starts its own `ssh-agent` and uses `ssh-keygen` and `ssh-add`; it is skipped when
+OpenSSH is not installed.
 
 ### Python CLI compatibility tests
 

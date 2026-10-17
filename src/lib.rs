@@ -48,7 +48,7 @@
 //!
 //! - `cli` (default): the `keepassxcr` binary. Library users can skip its
 //!   dependencies (clap, the clipboard, the progress bar, ...) with
-//!   `keepassxcr = { version = "0.2", default-features = false }`.
+//!   `keepassxcr = { version = "0.3", default-features = false }`.
 //!
 //! # Stability
 //!
@@ -66,6 +66,8 @@ pub mod crypto;
 pub mod error;
 pub mod format;
 pub mod model;
+#[doc(hidden)]
+pub mod ssh;
 pub(crate) mod util;
 pub(crate) mod xml;
 pub mod yubikey;

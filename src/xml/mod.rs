@@ -855,7 +855,7 @@ fn attr(attributes: &[(String, String)], key: &str) -> Option<String> {
 }
 
 /// Resolve an entity or character reference (`&amp;`, `&#13;`) in text.
-fn resolve_reference(reference: &BytesRef) -> AppResult<char> {
+pub(crate) fn resolve_reference(reference: &BytesRef) -> AppResult<char> {
     if let Some(ch) = reference
         .resolve_char_ref()
         .map_err(|_| AppError::Xml("invalid character reference".to_string()))?

@@ -44,6 +44,9 @@ pub(super) enum Request {
         challenge: String,
         challenge_response: Zeroizing<String>,
     },
+    /// Remove this SSH key (public blob in hex) from the ssh-agent at
+    /// `socket` when the database locks or the agent expires.
+    TrackSshKey { socket: PathBuf, public_key: String },
 }
 
 /// What `unlock` hands a new agent on stdin, as one JSON line.

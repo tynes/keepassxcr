@@ -95,6 +95,24 @@ impl AgentKey {
     }
 }
 
+impl AgentKey {
+    /// Have the agent remove an SSH key (by public blob) from the ssh-agent at
+    /// `socket` when the database locks or the agent expires.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the agent stopped.
+    pub fn track_ssh_key(&self, socket: &Path, public_blob: &[u8]) -> AppResult<()> {
+        #[cfg(unix)]
+        return client::track_ssh_key(self, socket, public_blob);
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, public_blob);
+            Err(unsupported())
+        }
+    }
+}
+
 /// A running agent's view of its database.
 #[derive(Debug, Clone)]
 pub struct AgentStatus {
