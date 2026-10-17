@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +46,9 @@ struct Agent {
     /// Milliseconds after `started` of the last request. Kept outside `state`
     /// so the expiry watcher never waits for a request in progress.
     last_used_ms: AtomicU64,
+    /// Requests still running their KDF. The idle timeout waits for them; the
+    /// maximum lifetime does not.
+    busy: AtomicUsize,
     yubikey: Option<YubiKeySlot>,
     state: Mutex<State>,
 }
@@ -98,6 +101,7 @@ fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, Un
         max,
         socket_inode,
         last_used_ms: AtomicU64::new(0),
+        busy: AtomicUsize::new(0),
         yubikey: startup.yubikey,
         state: Mutex::new(State {
             key,
@@ -106,6 +110,24 @@ fn start(database: &Path, idle: Duration, max: Duration) -> AppResult<(Agent, Un
         }),
     };
     Ok((agent, listener))
+}
+
+/// Marks a request as running its KDF; on drop, restarts the idle timeout
+/// from when the request finished.
+struct Busy<'a>(&'a Agent);
+
+impl<'a> Busy<'a> {
+    fn start(agent: &'a Agent) -> Self {
+        agent.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(agent)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Agent {
@@ -182,6 +204,7 @@ impl Agent {
             None => {
                 // Run the KDF without holding the lock: it can take as long as
                 // the file's settings say, and expiry must not wait for it.
+                let _busy = Busy::start(self);
                 let mut raw = Zeroizing::new(self.state().key.to_vec());
                 if let Some(response) = &challenge_response {
                     raw.extend_from_slice(&response[..]);
@@ -268,7 +291,7 @@ impl Agent {
             if max_left.is_zero() {
                 self.shutdown(Some("maximum lifetime reached"));
             }
-            if idle_left.is_zero() {
+            if idle_left.is_zero() && self.busy.load(Ordering::SeqCst) == 0 {
                 self.shutdown(Some("idle timeout"));
             }
         }
