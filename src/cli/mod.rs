@@ -100,9 +100,12 @@ pub enum Command {
     Lock(LockArgs),
     /// Show whether a database is unlocked and for how long.
     Status(LockArgs),
-    /// Use a YubiKey plugged into another machine.
+    /// Use a YubiKey or security key plugged into another machine.
     #[command(subcommand)]
     Yubikey(YubiKeyCommand),
+    /// Protect a key file with FIDO2 security keys (e.g. a Yubico Security Key).
+    #[command(subcommand)]
+    Fido2(Fido2Command),
     /// Run the unlock agent (started by `unlock`).
     #[command(name = "__agent", hide = true)]
     Agent(AgentArgs),
@@ -166,12 +169,102 @@ pub struct UnlockArgs {
 /// YubiKey subcommands.
 #[derive(Debug, Subcommand)]
 pub enum YubiKeyCommand {
-    /// Answer YubiKey challenges from a socket, e.g. forwarded with `ssh -R`.
+    /// Answer YubiKey and security key requests from a socket, e.g. forwarded
+    /// with `ssh -R`.
     ///
-    /// Run this where the YubiKey is plugged in. On the other machine
-    /// keepassxcr uses $KEEPASSXCR_YUBIKEY_SOCKET, or ~/.keepassxcr-yubikey.sock
-    /// when it exists, instead of USB.
+    /// Run this where the key is plugged in. On the other machine keepassxcr
+    /// uses $KEEPASSXCR_YUBIKEY_SOCKET, or ~/.keepassxcr-yubikey.sock when it
+    /// exists, instead of USB. A security key's PIN is asked for here.
     Serve(YubiKeyServeArgs),
+}
+
+/// FIDO2 key file subcommands.
+///
+/// A FIDO2-protected key file (`.fido2`) holds an ordinary KeePass key file
+/// encrypted so that only an enrolled security key can open it. Pass it to
+/// `--key-file` like any key file; the database stays a standard KeePassXC
+/// file that KeePassXC opens with the plain key file.
+#[derive(Debug, Subcommand)]
+pub enum Fido2Command {
+    /// Create a FIDO2-protected key file with the plugged-in security key.
+    ///
+    /// Without --from, a new random key file is made and its plain copy is
+    /// written to --backup: keep that copy offline, it is what KeePassXC opens
+    /// the database with and the way back in if the security key is lost.
+    Enroll(Fido2EnrollArgs),
+    /// Enrol another security key, e.g. a spare, in a FIDO2-protected key file.
+    AddKey(Fido2AddKeyArgs),
+    /// List the security keys enrolled in a FIDO2-protected key file.
+    List(Fido2FileArgs),
+    /// Remove an enrolled security key (by its number in `list`).
+    RemoveKey(Fido2RemoveKeyArgs),
+    /// Decrypt a FIDO2-protected key file back to the plain key file.
+    Export(Fido2ExportArgs),
+}
+
+/// `fido2 enroll` arguments.
+#[derive(Debug, Args)]
+pub struct Fido2EnrollArgs {
+    /// The FIDO2-protected key file to create (e.g. personal.keyx.fido2).
+    pub file: PathBuf,
+    /// Protect this existing key file instead of making a new one.
+    #[arg(long, value_name = "KEY_FILE", conflicts_with = "backup")]
+    pub from: Option<PathBuf>,
+    /// Where to write the plain copy of the new key file.
+    #[arg(long, value_name = "PATH", required_unless_present = "from")]
+    pub backup: Option<PathBuf>,
+    #[command(flatten)]
+    pub key: Fido2KeyArgs,
+}
+
+/// How a security key is enrolled.
+#[derive(Debug, Args)]
+pub struct Fido2KeyArgs {
+    /// Name for this security key, shown by `fido2 list`.
+    #[arg(long, default_value = "security key")]
+    pub label: String,
+    /// Unlock with a touch only, even when the key has a PIN.
+    #[arg(long)]
+    pub no_pin: bool,
+}
+
+/// `fido2 add-key` arguments.
+#[derive(Debug, Args)]
+pub struct Fido2AddKeyArgs {
+    /// The FIDO2-protected key file.
+    pub file: PathBuf,
+    /// Read the key file from this plain copy instead of unlocking with an
+    /// enrolled security key.
+    #[arg(long, value_name = "KEY_FILE")]
+    pub from: Option<PathBuf>,
+    #[command(flatten)]
+    pub key: Fido2KeyArgs,
+}
+
+/// A FIDO2-protected key file.
+#[derive(Debug, Args)]
+pub struct Fido2FileArgs {
+    /// The FIDO2-protected key file.
+    pub file: PathBuf,
+}
+
+/// `fido2 remove-key` arguments.
+#[derive(Debug, Args)]
+pub struct Fido2RemoveKeyArgs {
+    /// The FIDO2-protected key file.
+    pub file: PathBuf,
+    /// Number of the key to remove, as `fido2 list` shows it.
+    pub number: usize,
+}
+
+/// `fido2 export` arguments.
+#[derive(Debug, Args)]
+pub struct Fido2ExportArgs {
+    /// The FIDO2-protected key file.
+    pub file: PathBuf,
+    /// Write the plain key file here (refuses to overwrite).
+    #[arg(long, short, value_name = "PATH")]
+    pub output: PathBuf,
 }
 
 /// `yubikey serve` arguments.

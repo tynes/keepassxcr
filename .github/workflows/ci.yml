@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo test --locked --features software-yubikey
+      - run: cargo test --locked --features software-yubikey,software-fido2
 
   clippy:
     name: Clippy
@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets --features software-yubikey -- -D warnings
+      - run: cargo clippy --locked --all-targets --features software-yubikey,software-fido2 -- -D warnings
       # The library alone, as a `default-features = false` dependency builds it.
       - run: cargo clippy --locked --lib --no-default-features -- -D warnings
       - run: cargo test --locked --lib --no-default-features

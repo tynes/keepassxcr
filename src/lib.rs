@@ -53,7 +53,7 @@
 //! # Stability
 //!
 //! The API may still change between 0.x releases. The public modules are
-//! [`mod@format`], [`model`], [`crypto`], [`error`] and [`yubikey`]; anything
+//! [`mod@format`], [`model`], [`crypto`], [`error`], [`yubikey`] and [`fido2`]; anything
 //! hidden from these docs serves the command-line tool and is not part of the
 //! library API.
 
@@ -64,6 +64,7 @@ pub mod agent;
 pub mod cli;
 pub mod crypto;
 pub mod error;
+pub mod fido2;
 pub mod format;
 pub mod model;
 #[doc(hidden)]

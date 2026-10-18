@@ -24,10 +24,50 @@ impl std::fmt::Debug for KeyFile {
 
 impl KeyFile {
     /// Load a key file from disk.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be read, is a malformed XML key file, or is
+    /// a FIDO2-protected key file, which [`crate::fido2::load_key_file`] opens.
     pub fn load(path: &Path) -> AppResult<Self> {
         let data = Zeroizing::new(fs::read(path)?);
-        let raw_key = Zeroizing::new(parse_keyfile(&data)?);
+        if crate::fido2::WrappedKeyFile::parse(&data).is_some() {
+            return Err(AppError::InvalidInput(format!(
+                "{} is protected by a FIDO2 security key; open it with fido2::load_key_file",
+                path.display()
+            )));
+        }
+        Self::from_bytes(&data)
+    }
+
+    /// A key file from its contents, in any format KeePassXC accepts.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a malformed XML key file.
+    pub fn from_bytes(data: &[u8]) -> AppResult<Self> {
+        let raw_key = Zeroizing::new(parse_keyfile(data)?);
         Ok(Self { raw_key })
+    }
+
+    /// A new random key file in KeePassXC's XML format 2.0 (`.keyx`), as
+    /// KeePassXC's "Generate" button writes it.
+    pub fn generate_xml() -> Zeroizing<Vec<u8>> {
+        use rand::RngCore;
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut key[..]);
+        let hex = Zeroizing::new(hex::encode_upper(&key[..]));
+        let check = hex::encode_upper(&sha256(&key[..])[..4]);
+        let groups: Vec<&str> = (0..8).map(|i| &hex[i * 8..i * 8 + 8]).collect();
+        let text = Zeroizing::new(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <KeyFile>\n    <Meta>\n        <Version>2.0</Version>\n    </Meta>\n    <Key>\n        \
+                 <Data Hash=\"{check}\">\n            {}\n            {}\n        </Data>\n    \
+                 </Key>\n</KeyFile>\n",
+            groups[..4].join(" "),
+            groups[4..].join(" "),
+        ));
+        Zeroizing::new(text.as_bytes().to_vec())
     }
 
     /// Raw key bytes.
