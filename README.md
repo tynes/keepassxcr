@@ -203,6 +203,48 @@ leftover socket from an earlier connection makes `ssh -R` fail to bind; add
 connected, anyone with root on the server can send challenges to your key, as with ssh-agent
 forwarding; a slot set up with `--touch` still needs your finger for each one.
 
+### FIDO2 security keys (key file protection)
+
+KeePassXC can only unlock with a YubiKey's HMAC-SHA1 challenge-response slot, which FIDO2-only
+keys such as Yubico's Security Key series do not have. With those keys keepassxcr protects the
+database's key file instead: the database stays a standard KeePassXC file that needs a password
+and a key file, and keepassxcr keeps the key file encrypted so that only an enrolled security
+key can open it (the FIDO2 `hmac-secret` extension, with a touch and the key's PIN).
+
+```sh
+keepassxcr fido2 enroll passwords.keyx.fido2 --backup passwords.keyx --label "Security Key"
+keepassxcr db-create passwords.kdbx --key-file passwords.keyx.fido2
+keepassxcr show passwords.kdbx Email/Gmail --key-file passwords.keyx.fido2   # PIN + touch
+keepassxcr unlock passwords.kdbx --key-file passwords.keyx.fido2             # PIN + touch once
+```
+
+On disk that is two files next to each other:
+
+- `passwords.kdbx`: an ordinary KDBX 4 database.
+- `passwords.keyx.fido2`: a small JSON file holding the key file encrypted to each enrolled
+  security key (XChaCha20-Poly1305 under a key derived from the security key's `hmac-secret`
+  answer). It holds no secret in clear and is useless without the security key.
+
+`--backup` writes the plain key file (KeePassXC's `.keyx` format, readable only by you). Keep it
+offline: KeePassXC opens the database with it and the password, and it is the way back in if the
+security key is lost. Any command that takes `--key-file` accepts the `.fido2` file, so the unlock
+agent and scripts work unchanged; after `unlock` neither reads nor saves need the key again.
+
+```sh
+keepassxcr fido2 enroll new.keyx.fido2 --from existing.keyx   # protect a key file you already use
+keepassxcr fido2 add-key passwords.keyx.fido2 --label Spare   # enrol a spare key
+keepassxcr fido2 list passwords.keyx.fido2
+keepassxcr fido2 remove-key passwords.keyx.fido2 1
+keepassxcr fido2 export passwords.keyx.fido2 --output passwords.keyx   # plain copy again
+```
+
+A key with a PIN set is enrolled to require it; `--no-pin` enrols it for a touch only. Set a PIN
+with `ykman fido access change-pin`. Without a terminal (in scripts), the PIN is read from
+`KEEPASSXCR_FIDO2_PIN`. keepassxcr talks CTAP2 to the key's FIDO interface over USB (IOKit on
+macOS, needing no special permission; hidraw on Linux, where your distribution's FIDO udev rules
+give access). `yubikey serve` also answers security key requests, so the forwarding described
+above works for these keys too, with the PIN typed on the machine the key is plugged into.
+
 ### SSH keys
 
 keepassxcr loads SSH keys stored in entries into your ssh-agent, using the same settings as
@@ -264,7 +306,11 @@ ssh-agent until you remove it or its own lifetime runs out. Keys go to the agent
 | | `analyze` | Analyze passwords with offline HIBP data |
 | **SSH keys** | `ssh-add` | Load SSH keys from entries into ssh-agent (`-l` list, `-d` remove, `--all`) |
 | | `ssh-key-import` | Store an SSH private key in an entry, set up like KeePassXC's SSH agent tab |
-| **YubiKey** | `yubikey serve` | Answer YubiKey challenges forwarded from another machine |
+| **YubiKey** | `yubikey serve` | Answer YubiKey and security key requests forwarded from another machine |
+| **FIDO2 key files** | `fido2 enroll` | Protect a key file with a FIDO2 security key (new, or `--from` an existing one) |
+| | `fido2 add-key`, `fido2 remove-key` | Enrol another security key, or remove one |
+| | `fido2 list` | List the enrolled security keys |
+| | `fido2 export` | Write the plain key file back out |
 | **Unlock agent** | `unlock` | Keep a database unlocked in a background agent (`--ssh-add` also loads SSH keys) |
 | | `lock` | Stop the agent for a database, or all of them |
 | | `status` | Show whether a database is unlocked and for how long |
@@ -276,7 +322,7 @@ ssh-agent until you remove it or its own lifetime runs out. Keys go to the agent
 | Ciphers | AES-128-CBC, AES-256-CBC, Twofish-CBC, ChaCha20 |
 | KDFs | AES-KDF, Argon2d, Argon2id |
 | Protected streams | Salsa20, ChaCha20 |
-| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0), YubiKey HMAC-SHA1 challenge-response |
+| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0), YubiKey HMAC-SHA1 challenge-response, key file protected by a FIDO2 security key (`hmac-secret`) |
 | Formats | KDBX 3.1, KDBX 4.0, KDBX 4.1 |
 
 All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`). There are no C bindings for cryptography; on macOS, USB access to a YubiKey goes through `hidapi`'s IOKit backend.
@@ -329,6 +375,15 @@ src/
 │   ├── hid.rs           USB access through hidapi
 │   ├── forward.rs       `yubikey serve` and forwarded-socket client
 │   └── emulator.rs      Software YubiKey for tests (`software-yubikey` feature)
+├── fido2/
+│   ├── mod.rs           Finding keys, enrolling, getting an hmac-secret
+│   ├── wrapped.rs       The `.fido2` key file format
+│   ├── client.rs        CTAP2 commands (getInfo, clientPIN, makeCredential, getAssertion)
+│   ├── pinuv.rs         PIN/UV auth protocols one and two (ECDH, AES, HMAC)
+│   ├── ctaphid.rs       CTAPHID framing over 64-byte HID reports
+│   ├── cbor.rs          The CBOR subset CTAP2 uses
+│   ├── hid.rs           USB access through hidapi
+│   └── emulator.rs      Software FIDO2 authenticator for tests (`software-fido2` feature)
 └── util/
     ├── mod.rs           Utility module root
     ├── byteio.rs        Binary read/write helpers
@@ -342,12 +397,14 @@ With [just](https://github.com/casey/just) installed, `just build` builds, `just
 ### Rust unit tests
 
 ```sh
-cargo test --features software-yubikey
+cargo test --features software-yubikey,software-fido2
 ```
 
 The `software-yubikey` feature replaces the USB YubiKey with an emulated one
 (`KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch]`) so the YubiKey tests in
-`tests/yubikey.rs` run without hardware. It is for tests only; never build a binary you use with it.
+`tests/yubikey.rs` run without hardware. `software-fido2` does the same for security keys
+(`KEEPASSXCR_SOFTWARE_FIDO2=<hex secret>[:pin=<PIN>][:v1][,...]`, one entry per key) for
+`tests/fido2.rs`. They are for tests only; never build a binary you use with them.
 
 `tests/ssh.rs` starts its own `ssh-agent` and uses `ssh-keygen` and `ssh-add`; it is skipped when
 OpenSSH is not installed.
@@ -364,6 +421,13 @@ uv run pytest
 The suite builds keepassxcr itself. It uses an installed `keepassxc-cli` from `$KEEPASSXC_CLI`, `PATH`, or `/Applications/KeePassXC.app` (`brew install --cask keepassxc` on macOS, `apt install keepassxc` on Debian/Ubuntu). Only when none is found does it build `keepassxc-cli` from the submodule, which needs cmake, Qt, Botan and KeePassXC's other build dependencies.
 
 The suite logs every command it runs and its exit code as it goes. Add `--log-cli-level=DEBUG` (e.g. `just compat --log-cli-level=DEBUG -k merge`) to also see each command's stdout and stderr; a failing test always prints its full log.
+
+`test_fido2_python.py` drives the emulated FIDO2 authenticator with Yubico's
+[python-fido2](https://github.com/Yubico/python-fido2), an independent CTAP2 client, for both PIN
+protocols and a CTAP 2.0 key, and checks it gets the same `hmac-secret` answers keepassxcr's own
+client gets. `test_fido2_compat.py` checks that keepassxc-cli opens databases made with a
+FIDO2-protected key file using the plain key file, and that a key file keepassxc-cli generates can
+be protected.
 
 ### YubiKey differential tests
 

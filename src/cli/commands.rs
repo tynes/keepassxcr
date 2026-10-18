@@ -18,8 +18,8 @@ use crate::cli::{
     AnalyzeArgs, AttachmentExportArgs, AttachmentImportArgs, AttachmentRemoveArgs, ClipArgs,
     Command, DbCreateArgs, DbEditArgs, DbExportArgs, DbImportArgs, DbOpenArgs, DicewareArgs,
     EntryAddArgs, EntryEditArgs, EntryMoveArgs, EntryPathArgs, EntryShowArgs, EstimateArgs,
-    GenerateArgs, GroupCreateArgs, GroupPathArgs, LockArgs, MergeArgs, PasswordOptionsArgs,
-    SearchArgs, UnlockArgs, YubiKeyCommand,
+    Fido2Command, GenerateArgs, GroupCreateArgs, GroupPathArgs, LockArgs, MergeArgs,
+    PasswordOptionsArgs, SearchArgs, UnlockArgs, YubiKeyCommand,
 };
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
@@ -71,6 +71,7 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
         Command::Lock(args) => lock(args).context("lock failed"),
         Command::Status(args) => status(args).context("status failed"),
         Command::Yubikey(command) => yubikey(command).context("yubikey failed"),
+        Command::Fido2(command) => fido2(command).context("fido2 failed"),
         Command::Agent(args) => serve_agent(args).context("agent failed"),
     }
 }
@@ -169,7 +170,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
         key_file: args
             .source_key_file
             .as_ref()
-            .map(|path| KeyFile::load(path))
+            .map(|path| load_key_file(path))
             .transpose()?,
         yubikey: args.source_yubikey,
         agent: None,
@@ -805,7 +806,7 @@ fn yubikey(command: YubiKeyCommand) -> anyhow::Result<()> {
                     Some(socket) => socket,
                     None => crate::yubikey::forward::socket_path()?,
                 };
-                crate::yubikey::forward::serve(&socket)?;
+                crate::yubikey::forward::serve(&socket, &mut security_key_pin)?;
                 Ok(())
             }
             #[cfg(not(unix))]
@@ -817,6 +818,177 @@ fn yubikey(command: YubiKeyCommand) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Environment variable with a security key PIN, for scripts without a terminal.
+const FIDO2_PIN_ENV: &str = "KEEPASSXCR_FIDO2_PIN";
+
+/// Ask for a security key's PIN on the terminal, or read it from
+/// `KEEPASSXCR_FIDO2_PIN`.
+fn security_key_pin() -> AppResult<Zeroizing<String>> {
+    if let Some(pin) = std::env::var_os(FIDO2_PIN_ENV) {
+        return Ok(Zeroizing::new(pin.to_string_lossy().into_owned()));
+    }
+    // Reads the terminal itself, so a password piped on stdin is not taken.
+    rpassword::prompt_password("Security key PIN: ")
+        .map(Zeroizing::new)
+        .map_err(|err| {
+            AppError::Fido2(format!(
+                "the security key needs its PIN and there is no terminal to ask on ({err}); \
+                 set {FIDO2_PIN_ENV}"
+            ))
+        })
+}
+
+/// Load a key file, unlocking it with a security key if it is FIDO2-protected.
+fn load_key_file(path: &Path) -> AppResult<KeyFile> {
+    crate::fido2::load_key_file(path, &mut security_key_pin)
+}
+
+fn fido2(command: Fido2Command) -> anyhow::Result<()> {
+    use crate::fido2::{WrappedKeyFile, print_touch_prompt};
+
+    match command {
+        Fido2Command::Enroll(args) => {
+            if args.file.exists() {
+                return Err(anyhow::anyhow!(AppError::InvalidInput(format!(
+                    "{} already exists; use 'fido2 add-key' to enrol another key",
+                    args.file.display()
+                ))));
+            }
+            let key_file = match &args.from {
+                Some(from) => {
+                    let data = Zeroizing::new(fs::read(from)?);
+                    if WrappedKeyFile::parse(&data).is_some() {
+                        return Err(anyhow::anyhow!(AppError::InvalidInput(format!(
+                            "{} is already FIDO2-protected",
+                            from.display()
+                        ))));
+                    }
+                    KeyFile::from_bytes(&data)?;
+                    data
+                }
+                None => KeyFile::generate_xml(),
+            };
+            let wrapped = WrappedKeyFile::create(
+                &key_file,
+                &args.key.label,
+                !args.key.no_pin,
+                &mut security_key_pin,
+                &mut print_touch_prompt,
+            )?;
+            if let Some(backup) = &args.backup {
+                write_new_private_file(backup, &key_file)?;
+            }
+            wrapped.save(&args.file)?;
+            report_enrolled(&wrapped);
+            println!("Wrote {}", args.file.display());
+            if let Some(backup) = &args.backup {
+                println!(
+                    "Wrote the plain key file to {}; keep it offline. KeePassXC opens the \
+                     database with it, and it is the way back in if the security key is lost.",
+                    backup.display()
+                );
+            }
+            Ok(())
+        }
+        Fido2Command::AddKey(args) => {
+            let mut wrapped = WrappedKeyFile::load(&args.file)?;
+            let key_file = match &args.from {
+                Some(from) => {
+                    let data = Zeroizing::new(fs::read(from)?);
+                    if !wrapped.holds(&KeyFile::from_bytes(&data)?) {
+                        return Err(anyhow::anyhow!(AppError::InvalidInput(format!(
+                            "{} is not the key file protected by {}",
+                            from.display(),
+                            args.file.display()
+                        ))));
+                    }
+                    data
+                }
+                None => {
+                    let plain =
+                        wrapped.unwrap_key(&mut security_key_pin, &mut print_touch_prompt)?;
+                    if io::stdin().is_terminal() {
+                        eprint!(
+                            "Unlocked. Plug in the security key to add (unplug the enrolled one if \
+                             you only have one port), then press Enter: "
+                        );
+                        let mut line = String::new();
+                        io::stdin().lock().read_line(&mut line)?;
+                    }
+                    plain
+                }
+            };
+            wrapped.add_key(
+                &key_file,
+                &args.key.label,
+                !args.key.no_pin,
+                &mut security_key_pin,
+                &mut print_touch_prompt,
+            )?;
+            wrapped.save(&args.file)?;
+            report_enrolled(&wrapped);
+            Ok(())
+        }
+        Fido2Command::List(args) => {
+            let wrapped = WrappedKeyFile::load(&args.file)?;
+            for (number, entry) in wrapped.keys().iter().enumerate() {
+                let unlock = if entry.pin { "PIN and touch" } else { "touch" };
+                println!("{}. {} ({unlock})", number + 1, entry.label);
+            }
+            Ok(())
+        }
+        Fido2Command::RemoveKey(args) => {
+            let mut wrapped = WrappedKeyFile::load(&args.file)?;
+            let removed = wrapped.remove_key(args.number.saturating_sub(1))?;
+            wrapped.save(&args.file)?;
+            println!("Removed {}", removed.label);
+            Ok(())
+        }
+        Fido2Command::Export(args) => {
+            let wrapped = WrappedKeyFile::load(&args.file)?;
+            let plain = wrapped.unwrap_key(&mut security_key_pin, &mut print_touch_prompt)?;
+            write_new_private_file(&args.output, &plain)?;
+            println!("Wrote the plain key file to {}", args.output.display());
+            Ok(())
+        }
+    }
+}
+
+fn report_enrolled(wrapped: &crate::fido2::WrappedKeyFile) {
+    if let Some(entry) = wrapped.keys().last() {
+        let unlock = if entry.pin {
+            "unlocks with its PIN and a touch"
+        } else {
+            "unlocks with a touch"
+        };
+        println!("Enrolled {}: {unlock}", entry.label);
+        if !entry.pin {
+            eprintln!(
+                "Note: without a PIN anyone holding the security key can unlock the key file. \
+                 Set one with 'ykman fido access change-pin' and enrol again to require it."
+            );
+        }
+    }
+}
+
+/// Create `path` readable only by this user, refusing to replace a file.
+fn write_new_private_file(path: &Path, data: &[u8]) -> AppResult<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            AppError::InvalidInput(format!("{} already exists", path.display()))
+        } else {
+            AppError::Io(err)
+        }
+    })?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn serve_agent(args: crate::cli::AgentArgs) -> anyhow::Result<()> {
@@ -900,7 +1072,7 @@ fn build_credentials_with(
     let key_file = args
         .key_file
         .as_ref()
-        .map(|path| KeyFile::load(path))
+        .map(|path| load_key_file(path))
         .transpose()?;
 
     Ok(Credentials {
@@ -950,7 +1122,7 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
     };
 
     let key_file = if let Some(path) = &args.new_key_file {
-        Some(KeyFile::load(path)?)
+        Some(load_key_file(path)?)
     } else {
         current.key_file.clone()
     };

@@ -6,6 +6,19 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- FIDO2 security keys without a challenge-response slot, such as Yubico's
+  Security Key series, can protect a database's key file: `fido2 enroll`
+  writes a `.fido2` file holding the key file encrypted with the key's
+  `hmac-secret` answer (a touch and the key's PIN). Every `--key-file`
+  option accepts it, and the database stays a standard KeePassXC file that
+  KeePassXC opens with the plain key file. `fido2 add-key`, `list`,
+  `remove-key` and `export` manage it.
+- `yubikey serve` also answers security key requests, so a security key
+  plugged into another machine works over a forwarded socket; its PIN is
+  typed where the key is.
+
 ## [0.3.1] - 2026-10-18
 
 ### Changed

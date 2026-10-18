@@ -64,7 +64,7 @@ jobs:
 
       - name: Test
         if: steps.check.outputs.needed == 'true'
-        run: cargo test --locked --features software-yubikey
+        run: cargo test --locked --features software-yubikey,software-fido2
 
       - name: Publish to crates.io
         if: steps.check.outputs.needed == 'true' && steps.check.outputs.published != 'true'

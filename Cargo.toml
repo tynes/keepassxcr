@@ -61,6 +61,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
 # YubiKey OTP interface: IOKit on macOS (opened shared), pure-Rust hidraw on Linux.
 hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev", "macos-shared-device"] }
+# FIDO2 security keys (hmac-secret): ECDH for CTAP's PIN protocols, HKDF, and
+# the AEAD that encrypts FIDO2-protected key files.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
 # Reading OpenSSH private keys for `ssh-add`.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ecdsa", "encryption"], optional = true }
 ssh-encoding = { version = "0.2", optional = true }
@@ -73,6 +78,9 @@ cli = ["dep:anyhow", "dep:clap", "dep:rpassword", "dep:indicatif", "dep:arboard"
 # Testing only: KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch] replaces the
 # USB YubiKey with an emulated one. Never enable this for a build you use.
 software-yubikey = []
+# Testing only: KEEPASSXCR_SOFTWARE_FIDO2=<hex secret>[:pin=<PIN>][:v1][,...] replaces
+# USB security keys with emulated FIDO2 authenticators. Never enable this for a build you use.
+software-fido2 = []
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -83,3 +91,7 @@ predicates = "3.1"
 # keepassxcr ignore this.
 [profile.dev.package."*"]
 opt-level = 3
+
+[[example]]
+name = "fido2_bridge"
+required-features = ["software-fido2"]
