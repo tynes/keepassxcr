@@ -6,6 +6,8 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-18
+
 ### Changed
 
 - A missing group now names the first group that doesn't exist and the
@@ -92,7 +94,8 @@ First release on crates.io.
 - The `keepassxcr` library crate, exposing the KDBX reader and writer and the
   database model.
 
-[Unreleased]: https://github.com/tynes/keepassxcr/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/tynes/keepassxcr/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/tynes/keepassxcr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tynes/keepassxcr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tynes/keepassxcr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/tynes/keepassxcr/releases/tag/v0.1.0

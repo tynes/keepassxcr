@@ -9,7 +9,7 @@ writing KeePass databases.
 - Reads and writes **KDBX 3.1** and **KDBX 4.x** databases
 - CLI-compatible with `keepassxc-cli`
 - Pure Rust cryptography (no C bindings)
-- v0.3.0 — early development; keep a backup of any database you use it on
+- v0.3.1 — early development; keep a backup of any database you use it on
 
 ## Install
 
@@ -387,18 +387,17 @@ git submodule update --init
 
 ## Releasing
 
-Releases are published by `.github/workflows/release.yml` when a `v*` tag is pushed:
+`.github/workflows/release.yml` publishes a release when a version bump reaches `main`:
 
-1. Move the `Unreleased` notes in `CHANGELOG.md` under the new version, and bump `version` in
-   `Cargo.toml` to match. Merge that to `main`.
-2. Tag the merge commit and push the tag:
-   ```sh
-   git tag -a v0.1.0 -m "keepassxcr 0.1.0"
-   git push origin v0.1.0
-   ```
-3. The workflow checks that the tag matches `Cargo.toml`, runs the tests, publishes to crates.io
-   with the `CARGO_REGISTRY_TOKEN` repository secret, and creates the GitHub release from that
-   version's `CHANGELOG.md` section.
+1. In a PR, move the `Unreleased` notes in `CHANGELOG.md` under the new version and bump
+   `version` in `Cargo.toml` to match (run `cargo check` so `Cargo.lock` follows).
+2. Merge it. The workflow sees a version that is not on crates.io yet, runs the tests, publishes
+   it with the `CARGO_REGISTRY_TOKEN` repository secret, and creates the `v<version>` tag and the
+   GitHub release from that version's `CHANGELOG.md` section.
+
+A merge that changes `Cargo.toml` without a new version does nothing. If a release fails partway,
+fix the cause and run the workflow again from the Actions tab: it skips whatever is already done.
+Pushing a `v*` tag by hand also works.
 
 To publish by hand instead: `cargo publish --dry-run`, then `cargo login` and `cargo publish`.
 
