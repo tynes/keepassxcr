@@ -114,7 +114,7 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 
 fn db_edit(args: DbEditArgs) -> anyhow::Result<()> {
     // The new credentials start from the current ones, so they must be known here.
-    let credentials = build_local_credentials(&args.credentials)?;
+    let credentials = build_local_credentials(&args.database, &args.credentials)?;
     let file = read_kdbx(&args.database, &credentials)?;
 
     let new_credentials = build_new_credentials(&args, &credentials)?;
@@ -689,7 +689,7 @@ fn unlock(args: UnlockArgs) -> anyhow::Result<()> {
         println!("Already unlocked; {}", describe_unlocked(&status));
         return Ok(());
     }
-    let credentials = build_local_credentials(&args.credentials)?;
+    let credentials = build_local_credentials(&args.database, &args.credentials)?;
     if credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "unlock requires at least one credential".to_string(),
@@ -845,21 +845,35 @@ pub(crate) fn build_credentials(
             agent: Some(key),
         });
     }
-    build_local_credentials(args)
+    build_local_credentials(database, args)
 }
 
 /// Build credentials from CLI arguments only, ignoring any agent.
-fn build_local_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
-    build_credentials_with(args, false)
+fn build_local_credentials(
+    database: &Path,
+    args: &crate::cli::CredentialArgs,
+) -> AppResult<Credentials> {
+    build_credentials_with(args, &unlock_prompt(database), false)
+}
+
+/// The unlock prompt, worded like keepassxc-cli's so it reads as a question
+/// about the database rather than as an entry's Password field.
+fn unlock_prompt(database: &Path) -> String {
+    let name = database.file_name().map_or_else(
+        || database.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("Enter password to unlock {name}: ")
 }
 
 /// Build credentials for a new database, asking twice for a prompted password.
 fn build_new_database_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
-    build_credentials_with(args, true)
+    build_credentials_with(args, "Password: ", true)
 }
 
 fn build_credentials_with(
     args: &crate::cli::CredentialArgs,
+    prompt: &str,
     confirm: bool,
 ) -> AppResult<Credentials> {
     args.validate()?;
@@ -869,7 +883,7 @@ fn build_credentials_with(
     } else if args.no_password {
         None
     } else {
-        let prompt = read_secret("Password: ")?;
+        let prompt = read_secret(prompt)?;
         if confirm && !prompt.is_empty() {
             let repeat = read_secret("Repeat password: ")?;
             if repeat != prompt {

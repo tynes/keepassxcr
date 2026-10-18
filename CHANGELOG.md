@@ -12,6 +12,9 @@ All notable changes to this project are listed here. The format follows
   `mkdir` command that creates it, instead of a bare "group not found".
 - `open` no longer exits when a command fails: it prints the error and shows
   the prompt again. `exit`, Ctrl+D or Ctrl+C end the session.
+- The unlock prompt reads `Enter password to unlock <file>:`, like
+  keepassxc-cli, instead of `Password:`, which looked like an entry's
+  Password field in front of `show -a` output.
 
 ### Fixed
 
