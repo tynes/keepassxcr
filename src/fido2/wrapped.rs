@@ -194,10 +194,20 @@ impl WrappedKeyFile {
         }
         let existing = self.credential_ids()?;
         let existing: Vec<&[u8]> = existing.iter().map(Vec::as_slice).collect();
+        // Enrolling uses the PIN twice; ask for it once.
+        let mut typed: Option<Zeroizing<String>> = None;
+        let mut pin = || {
+            if let Some(known) = &typed {
+                return Ok(known.clone());
+            }
+            let entered = pin()?;
+            typed = Some(entered.clone());
+            Ok(entered)
+        };
         let Enrolled {
             credential_id,
             has_pin,
-        } = fido2::enroll(&self.rp_id, label, &existing, &mut *pin, &mut *on_touch)?;
+        } = fido2::enroll(&self.rp_id, label, &existing, &mut pin, &mut *on_touch)?;
         let uv = use_pin && has_pin;
         let mut salt = [0u8; 32];
         OsRng.fill_bytes(&mut salt);
@@ -207,8 +217,12 @@ impl WrappedKeyFile {
             salt: &salt,
             uv,
         };
-        let (_, secret) =
-            fido2::local_secret(&self.rp_id, std::slice::from_ref(&request), pin, on_touch)?;
+        let (_, secret) = fido2::local_secret(
+            &self.rp_id,
+            std::slice::from_ref(&request),
+            &mut pin,
+            on_touch,
+        )?;
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let aad = associated_data(&self.rp_id, &credential_id, &salt, uv);
