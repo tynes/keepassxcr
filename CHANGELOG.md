@@ -6,6 +6,18 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A missing group now names the first group that doesn't exist and the
+  `mkdir` command that creates it, instead of a bare "group not found".
+- `open` no longer exits when a command fails: it prints the error and shows
+  the prompt again. `exit`, Ctrl+D or Ctrl+C end the session.
+
+### Fixed
+
+- `open` exits on Ctrl+D (end of input) instead of printing the prompt
+  forever.
+
 ## [0.3.0] - 2026-10-17
 
 Loads SSH keys stored in a database into ssh-agent, compatible with

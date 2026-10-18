@@ -246,10 +246,13 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
 fn add_entry(args: EntryAddArgs) -> anyhow::Result<()> {
     let (mut file, credentials) = load_database(&args.database, &args.credentials)?;
     let (group_path, title) = split_entry_path(&args.entry)?;
+    if file.database.group_by_path(&group_path).is_none() {
+        return Err(group_not_found(&file.database, &group_path, &args.database).into());
+    }
     let group = file
         .database
         .group_by_path_mut(&group_path)
-        .ok_or_else(|| AppError::InvalidInput("group not found".to_string()))?;
+        .expect("group checked above");
 
     if group.find_entry(title).is_some() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
@@ -416,7 +419,7 @@ fn list_group(args: GroupPathArgs) -> anyhow::Result<()> {
     let group = file
         .database
         .group_by_path(&path)
-        .ok_or_else(|| AppError::InvalidInput("group not found".to_string()))?;
+        .ok_or_else(|| group_not_found(&file.database, &path, &args.database))?;
 
     for child in group.groups() {
         println!("[G] {}", child.name());
@@ -448,7 +451,7 @@ fn remove_group(args: GroupPathArgs) -> anyhow::Result<()> {
         .database
         .group_by_path(&path)
         .map(Group::uuid)
-        .ok_or_else(|| AppError::InvalidInput("group not found".to_string()))?;
+        .ok_or_else(|| group_not_found(&file.database, &path, &args.database))?;
     let removal = file.database.recycle_group(uuid);
     write_kdbx(&args.database, &file, &credentials)?;
     match removal {
@@ -1078,6 +1081,26 @@ pub(crate) fn split_group_path(path: Option<&str>) -> AppResult<Vec<&str>> {
     Ok(parts)
 }
 
+/// Build a "group not found" error that names the first missing group and
+/// says how to create it.
+pub(crate) fn group_not_found(database: &Database, path: &[&str], db_path: &Path) -> AppError {
+    let mut current = database.root();
+    let mut missing = Vec::new();
+    for segment in path {
+        missing.push(*segment);
+        match current.find_group(segment) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    let missing = missing.join("/");
+    AppError::InvalidInput(format!(
+        "group not found: {missing} (create it with: keepassxcr mkdir {db} {full})",
+        db = db_path.display(),
+        full = path.join("/"),
+    ))
+}
+
 fn ensure_group_path<'a>(mut group: &'a mut Group, path: &[&str]) -> &'a mut Group {
     for segment in path {
         if group.find_group(segment).is_none() {
@@ -1316,6 +1339,22 @@ mod tests {
         let (groups, entry) = split_entry_path("Group/Sub/Entry").expect("path");
         assert_eq!(groups, vec!["Group", "Sub"]);
         assert_eq!(entry, "Entry");
+    }
+
+    #[test]
+    fn group_not_found_names_first_missing_group() {
+        let mut database = Database::new("Root".to_string());
+        ensure_group_path(database.root_mut(), &["Email"]);
+        let err = group_not_found(&database, &["Email", "Work", "Old"], Path::new("db.kdbx"));
+        let message = err.to_string();
+        assert!(
+            message.contains("group not found: Email/Work "),
+            "{message}"
+        );
+        assert!(
+            message.contains("keepassxcr mkdir db.kdbx Email/Work/Old"),
+            "{message}"
+        );
     }
 
     #[test]
