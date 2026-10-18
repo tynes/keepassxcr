@@ -1,14 +1,26 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish that version to crates.io and create the
-# GitHub release. Needs a CARGO_REGISTRY_TOKEN repository secret with the
-# publish-new and publish-update scopes.
+# Publishes the version in Cargo.toml to crates.io and creates its GitHub
+# release (and v<version> tag) when:
+#   - a commit that changes Cargo.toml lands on main and that version is not
+#     released yet (bump the version in a PR and merge it), or
+#   - a v* tag is pushed by hand, or
+#   - the workflow is run by hand from the Actions tab (to retry a release).
+# Needs a CARGO_REGISTRY_TOKEN repository secret with the publish-new and
+# publish-update scopes.
 on:
   push:
+    branches: [main]
+    paths: [Cargo.toml]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,19 +32,42 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check the tag matches Cargo.toml
+      - name: Decide whether this version needs releasing
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "keepassxcr") | .version')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          tag="v$version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          published=false
+          if curl -sf -A "keepassxcr-release (github.com/tynes/keepassxcr)" \
+              "https://crates.io/api/v1/crates/keepassxcr/$version" > /dev/null; then
+            published=true
+          fi
+          released=false
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            released=true
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          if [ "$published" = true ] && [ "$released" = true ]; then
+            echo "keepassxcr $version is already released; nothing to do."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Test
+        if: steps.check.outputs.needed == 'true'
         run: cargo test --locked --features software-yubikey
 
       - name: Publish to crates.io
+        if: steps.check.outputs.needed == 'true' && steps.check.outputs.published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -40,15 +75,10 @@ jobs:
             echo "::error::Add a CARGO_REGISTRY_TOKEN repository secret (crates.io > Account Settings > API Tokens)"
             exit 1
           fi
-          # A re-run after a later step failed finds the version already there.
-          if curl -sf -A "keepassxcr-release (github.com/tynes/keepassxcr)" \
-              "https://crates.io/api/v1/crates/keepassxcr/$VERSION" > /dev/null; then
-            echo "keepassxcr $VERSION is already on crates.io"
-          else
-            cargo publish --locked
-          fi
+          cargo publish --locked
 
-      - name: Create the GitHub release
+      - name: Create the GitHub release and tag
+        if: steps.check.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -57,8 +87,9 @@ jobs:
             /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
             found && !/^\[[^]]+\]: / { print }
           ' CHANGELOG.md > notes.md
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
           else
-            gh release create "$GITHUB_REF_NAME" --title "keepassxcr $VERSION" --notes-file notes.md --verify-tag
+            # Creates the tag at this commit when it does not exist yet.
+            gh release create "$TAG" --title "keepassxcr $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
           fi
