@@ -6,6 +6,22 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `--fido2` unlocks a database with a FIDO2 security key through the
+  `hmac-secret` extension: a Ledger running the Security Key app, a YubiKey 5
+  or any other key that supports it. The device's secret takes the key-file
+  slot, so the file stays a standard KDBX 4 database. The credential id and
+  salt live in the `PublicCustomData` header, which KeePassXC keeps when it
+  saves. On a Ledger the credential comes from the seed, so a Ledger restored
+  from the same 24 words opens the database.
+- `db-create --fido2`, `db-edit --new-fido2` / `--unset-fido2` and
+  `merge --fido2-from` set up, remove and use a FIDO2 device, and `db-info`
+  shows which credential a database uses. With several devices plugged in,
+  the one confirmed on is used.
+- `fido2 serve` answers FIDO2 requests forwarded from another machine over a
+  socket, like `yubikey serve`.
+
 ## [0.3.1] - 2026-10-18
 
 ### Changed

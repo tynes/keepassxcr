@@ -22,7 +22,8 @@ cargo install keepassxcr --locked
 This puts `keepassxcr` in `~/.cargo/bin`. `--locked` builds with the exact dependency versions
 the release was tested with.
 
-On Linux the build needs no system libraries (YubiKey access goes straight to `/dev/hidraw*`).
+On Linux the build needs no system libraries (YubiKey and FIDO2 access goes straight to
+`/dev/hidraw*`).
 On macOS it compiles hidapi's small C backend for IOKit, so the Xcode command line tools must be
 installed (`xcode-select --install`).
 
@@ -58,14 +59,16 @@ if let Some(entry) = file.database.entry_by_path(&["Email"], "Gmail") {
 }
 ```
 
-For a key file or YubiKey, use `Credentials::builder()`. The
+For a key file or YubiKey, use `Credentials::builder()`. A FIDO2 device's secret goes in as a key
+file: `keepassxcr::fido2::secret` gives it and `KeyFile::from_raw` wraps it. The
 [crate documentation](https://docs.rs/keepassxcr) has a full example that creates and saves a
 database. The library API may still change between 0.x releases.
 
 ## Usage
 
 All commands that open a database accept credential flags:
-`--password <PW>`, `--key-file <FILE>`, `--no-password`, `-y, --yubikey <SLOT[:SERIAL]>`.
+`--password <PW>`, `--key-file <FILE>`, `--no-password`, `-y, --yubikey <SLOT[:SERIAL]>`,
+`--fido2`.
 
 Without `--password`, the password is prompted for, or read from stdin when stdin is not a
 terminal (`echo "$PW" | keepassxcr ls db.kdbx`). Prefer that over `--password`, which is visible
@@ -203,6 +206,55 @@ leftover socket from an earlier connection makes `ssh -R` fail to bind; add
 connected, anyone with root on the server can send challenges to your key, as with ssh-agent
 forwarding; a slot set up with `--touch` still needs your finger for each one.
 
+### FIDO2 security keys (Ledger)
+
+`--fido2` unlocks a database with a FIDO2 security key through the `hmac-secret` extension. A
+Ledger works with its **Security Key** app (Stax, Flex and Nano X; the Nano S Plus may only have
+U2F), as does a YubiKey 5 or any other key with `hmac-secret` (a key with a FIDO2 PIN set may refuse
+to register, as keepassxcr cannot send a PIN yet).
+
+```sh
+keepassxcr db-create --fido2 passwords.kdbx            # register the device (confirm twice)
+keepassxcr show --fido2 passwords.kdbx Email/Gmail
+keepassxcr db-edit passwords.kdbx --new-fido2           # add a device to a database
+keepassxcr db-edit --fido2 passwords.kdbx --unset-fido2 # remove it
+keepassxcr unlock --fido2 passwords.kdbx                # confirm once, then no device needed
+```
+
+Setting up registers a credential on the device and draws a random salt; to unlock, the device
+derives a fixed 32-byte secret from the two after you confirm on it. The secret takes the place
+of a key file, so `--fido2` cannot be combined with `--key-file`; a password and a YubiKey can be
+added as usual. The credential id and salt are not secret and are stored in the database's
+unencrypted KDBX 4 header (`PublicCustomData`), so `--fido2` needs a KDBX 4 database. Saving
+does not ask the device again.
+
+With several FIDO2 devices plugged in, each is asked and the one you confirm on is used.
+
+**Recovery:** on a Ledger the credential comes from the device's seed, so a Ledger restored from
+the same 24 words opens the database too (this comes from reading Ledger's source and has not
+been tested on a device, so restore a Ledger and check that the database opens before you rely
+on it). You need both the database file and such a device; there is no other way to get the
+secret back. KeePassXC itself has no FIDO2 support yet: it reads
+and saves these databases (keeping the FIDO2 settings) but cannot ask the device for the secret.
+
+On Linux you need read and write access to the device's hidraw node: most distributions grant it
+for FIDO keys, and Ledger's udev rules (`LedgerHQ/udev-rules`) cover Ledger devices.
+
+#### Using a FIDO2 device on another machine
+
+This works like `yubikey serve`. On the machine with the device:
+
+```sh
+keepassxcr fido2 serve       # listens on ~/.keepassxcr-fido2.sock
+ssh -R /home/me/.keepassxcr-fido2.sock:/Users/me/.keepassxcr-fido2.sock server
+```
+
+On the server keepassxcr uses `~/.keepassxcr-fido2.sock` when it exists (or the socket named in
+`KEEPASSXCR_FIDO2_SOCKET`), for unlocking and for `db-create --fido2`. Every request still needs
+your confirmation on the device. Unlike a YubiKey answer, which is useless after the next save,
+the FIDO2 secret never changes: anyone with root on the server who sees it once can reuse it
+until you run `db-edit --new-fido2`.
+
 ### SSH keys
 
 keepassxcr loads SSH keys stored in entries into your ssh-agent, using the same settings as
@@ -265,6 +317,7 @@ ssh-agent until you remove it or its own lifetime runs out. Keys go to the agent
 | **SSH keys** | `ssh-add` | Load SSH keys from entries into ssh-agent (`-l` list, `-d` remove, `--all`) |
 | | `ssh-key-import` | Store an SSH private key in an entry, set up like KeePassXC's SSH agent tab |
 | **YubiKey** | `yubikey serve` | Answer YubiKey challenges forwarded from another machine |
+| **FIDO2** | `fido2 serve` | Answer FIDO2 requests forwarded from another machine |
 | **Unlock agent** | `unlock` | Keep a database unlocked in a background agent (`--ssh-add` also loads SSH keys) |
 | | `lock` | Stop the agent for a database, or all of them |
 | | `status` | Show whether a database is unlocked and for how long |
@@ -276,10 +329,10 @@ ssh-agent until you remove it or its own lifetime runs out. Keys go to the agent
 | Ciphers | AES-128-CBC, AES-256-CBC, Twofish-CBC, ChaCha20 |
 | KDFs | AES-KDF, Argon2d, Argon2id |
 | Protected streams | Salsa20, ChaCha20 |
-| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0), YubiKey HMAC-SHA1 challenge-response |
+| Credentials | Password, key file (raw, hex, hashed, XML v1.0 and v2.0), YubiKey HMAC-SHA1 challenge-response, FIDO2 `hmac-secret` (as the key file) |
 | Formats | KDBX 3.1, KDBX 4.0, KDBX 4.1 |
 
-All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`). There are no C bindings for cryptography; on macOS, USB access to a YubiKey goes through `hidapi`'s IOKit backend.
+All cryptographic operations use pure Rust crates (`aes`, `twofish`, `chacha20`, `salsa20`, `argon2`, `p256`). There are no C bindings for cryptography; on macOS, USB access to a YubiKey or FIDO2 device goes through `hidapi`'s IOKit backend.
 
 ## Project structure
 
@@ -298,6 +351,14 @@ src/
 │   ├── commands.rs      Subcommand dispatch and handlers
 │   ├── ssh.rs           ssh-add, ssh-key-import, unlock --ssh-add
 │   └── interactive.rs   Interactive REPL (open command)
+├── fido2/
+│   ├── mod.rs           Enrolling and asking FIDO2 devices, picking one
+│   ├── config.rs        FIDO2 settings in the PublicCustomData header
+│   ├── ctaphid.rs       CTAPHID framing (packets, keepalive, cancel)
+│   ├── ctap.rs          CTAP2 commands and hmac-secret (PIN/UV protocol 1)
+│   ├── hid.rs           USB access through hidapi
+│   ├── forward.rs       `fido2 serve` and forwarded-socket client
+│   └── emulator.rs      Software FIDO2 device for tests (`software-fido2` feature)
 ├── crypto/
 │   ├── mod.rs           Crypto module root
 │   ├── constants.rs     Cipher, KDF, and stream UUIDs
@@ -332,6 +393,7 @@ src/
 └── util/
     ├── mod.rs           Utility module root
     ├── byteio.rs        Binary read/write helpers
+    ├── forward.rs       Device sockets shared by `yubikey serve` and `fido2 serve`
     └── unix.rs          User ids of processes and socket peers
 ```
 
@@ -342,12 +404,14 @@ With [just](https://github.com/casey/just) installed, `just build` builds, `just
 ### Rust unit tests
 
 ```sh
-cargo test --features software-yubikey
+cargo test --features software-yubikey,software-fido2
 ```
 
 The `software-yubikey` feature replaces the USB YubiKey with an emulated one
 (`KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch]`) so the YubiKey tests in
-`tests/yubikey.rs` run without hardware. It is for tests only; never build a binary you use with it.
+`tests/yubikey.rs` run without hardware. Likewise `software-fido2` replaces FIDO2 devices with
+an emulated authenticator (`KEEPASSXCR_SOFTWARE_FIDO2=<hex secret>`) for `tests/fido2.rs`. Both
+are for tests only; never build a binary you use with them.
 
 `tests/ssh.rs` starts its own `ssh-agent` and uses `ssh-keygen` and `ssh-add`; it is skipped when
 OpenSSH is not installed.
@@ -362,6 +426,10 @@ uv run pytest
 ```
 
 The suite builds keepassxcr itself. It uses an installed `keepassxc-cli` from `$KEEPASSXC_CLI`, `PATH`, or `/Applications/KeePassXC.app` (`brew install --cask keepassxc` on macOS, `apt install keepassxc` on Debian/Ubuntu). Only when none is found does it build `keepassxc-cli` from the submodule, which needs cmake, Qt, Botan and KeePassXC's other build dependencies.
+
+`tests/test_fido2_compat.py` builds keepassxcr with `software-fido2`, hands `keepassxc-cli` the
+emulated device's secret as a key file, and checks that KeePassXC opens such a database and keeps
+its FIDO2 settings when it saves.
 
 The suite logs every command it runs and its exit code as it goes. Add `--log-cli-level=DEBUG` (e.g. `just compat --log-cli-level=DEBUG -k merge`) to also see each command's stdout and stderr; a failing test always prints its full log.
 

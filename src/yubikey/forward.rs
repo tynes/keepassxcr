@@ -7,24 +7,17 @@
 //! 20-byte answer cross the connection; the touch prompt shows on both ends.
 //!
 //! Request: version (1), slot (1), serial big-endian (4, 0 = any key),
-//! padded challenge (64). Replies: any number of `TOUCH` bytes, then `OK`
-//! followed by the 20-byte answer, or `ERROR` followed by a big-endian u16
-//! length and a UTF-8 message.
+//! padded challenge (64). The reply framing is shared with `fido2 serve`
+//! (see `util::forward`); `OK` is followed by the 20-byte answer.
 
-use std::env;
-use std::ffi::OsString;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
-use crate::util::unix::{current_uid, peer_uid};
+use crate::util::forward::{Forwarding, reply};
 use crate::yubikey::otp::yubikey_error;
 use crate::yubikey::{
     CHALLENGE_LEN, RESPONSE_LEN, Response, TOUCH_PROMPT, YubiKeySlot, local_challenge,
@@ -32,19 +25,19 @@ use crate::yubikey::{
 
 /// Environment variable naming the socket to send challenges to.
 pub const SOCKET_ENV: &str = "KEEPASSXCR_YUBIKEY_SOCKET";
-/// Socket used when [`SOCKET_ENV`] is unset, relative to the home directory.
-const DEFAULT_SOCKET: &str = ".keepassxcr-yubikey.sock";
+
+const FORWARDING: Forwarding = Forwarding {
+    env: SOCKET_ENV,
+    default_socket: ".keepassxcr-yubikey.sock",
+    device: "YubiKey",
+    command: "yubikey serve",
+    touch_prompt: TOUCH_PROMPT,
+    answer_timeout: Duration::from_secs(60),
+    error: AppError::YubiKey,
+};
 
 const VERSION: u8 = 1;
 const REQUEST_LEN: usize = 2 + 4 + CHALLENGE_LEN;
-const MSG_OK: u8 = 0;
-const MSG_ERROR: u8 = 1;
-const MSG_TOUCH: u8 = 2;
-
-/// How long a client waits for an answer; covers the key's own touch timeout.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the server waits for a connected client's request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The socket `serve` listens on and clients look for by default:
 /// `$KEEPASSXCR_YUBIKEY_SOCKET`, or `~/.keepassxcr-yubikey.sock`.
@@ -53,19 +46,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Fails when neither the variable nor `HOME` is set.
 pub fn socket_path() -> AppResult<PathBuf> {
-    if let Some(path) = explicit_socket() {
-        return Ok(PathBuf::from(path));
-    }
-    env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(DEFAULT_SOCKET))
-        .ok_or_else(|| {
-            AppError::InvalidInput(format!("set {SOCKET_ENV} or HOME to choose a socket"))
-        })
-}
-
-fn explicit_socket() -> Option<OsString> {
-    env::var_os(SOCKET_ENV).filter(|path| !path.is_empty())
+    FORWARDING.socket_path()
 }
 
 /// Send a padded challenge through the forwarded socket, if one answers.
@@ -80,92 +61,21 @@ pub(super) fn challenge(
     slot: YubiKeySlot,
     padded: &[u8; CHALLENGE_LEN],
 ) -> AppResult<Option<Response>> {
-    let explicit = explicit_socket().is_some();
-    let Ok(path) = socket_path() else {
+    let Some(stream) = FORWARDING.connect()? else {
         return Ok(None);
     };
-    let stream = match connect(&path) {
-        Ok(stream) => stream,
-        Err(err) if explicit => {
-            return Err(yubikey_error(format!(
-                "cannot reach the forwarded YubiKey at {} ({err}); is 'keepassxcr yubikey serve' \
-                 running and the socket forwarded?",
-                path.display()
-            )));
-        }
-        Err(err) => {
-            if err.kind() != io::ErrorKind::NotFound {
-                warn!("ignoring YubiKey socket {}: {err}", path.display());
-            }
-            return Ok(None);
-        }
-    };
-    request(stream, slot, padded).map(Some)
-}
-
-/// Connect to a socket only if it is a socket owned by this user, so another
-/// user cannot plant one and collect challenges.
-fn connect(path: &Path) -> io::Result<UnixStream> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.file_type().is_socket() || meta.uid() != current_uid() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "not a socket owned by you",
-        ));
-    }
-    UnixStream::connect(path)
-}
-
-fn request(
-    mut stream: UnixStream,
-    slot: YubiKeySlot,
-    padded: &[u8; CHALLENGE_LEN],
-) -> AppResult<Response> {
-    let forward_error = |err: io::Error| yubikey_error(format!("forwarded YubiKey: {err}"));
-    stream
-        .set_read_timeout(Some(ANSWER_TIMEOUT))
-        .map_err(forward_error)?;
     let mut message = [0u8; REQUEST_LEN];
     message[0] = VERSION;
     message[1] = slot.slot;
     message[2..6].copy_from_slice(&slot.serial.unwrap_or(0).to_be_bytes());
     message[6..].copy_from_slice(padded);
-    stream.write_all(&message).map_err(forward_error)?;
-
-    let mut prompted = false;
-    loop {
-        let mut kind = [0u8; 1];
-        stream.read_exact(&mut kind).map_err(forward_error)?;
-        match kind[0] {
-            MSG_TOUCH if !prompted => {
-                prompted = true;
-                eprintln!("{TOUCH_PROMPT} (on the machine running 'keepassxcr yubikey serve')\n");
-            }
-            MSG_TOUCH => {}
-            MSG_OK => {
-                let mut response = Zeroizing::new([0u8; RESPONSE_LEN]);
-                stream
-                    .read_exact(&mut response[..])
-                    .map_err(forward_error)?;
-                return Ok(response);
-            }
-            MSG_ERROR => {
-                let mut len = [0u8; 2];
-                stream.read_exact(&mut len).map_err(forward_error)?;
-                let mut text = vec![0u8; usize::from(u16::from_be_bytes(len))];
-                stream.read_exact(&mut text).map_err(forward_error)?;
-                return Err(yubikey_error(format!(
-                    "forwarded YubiKey: {}",
-                    String::from_utf8_lossy(&text)
-                )));
-            }
-            other => {
-                return Err(yubikey_error(format!(
-                    "forwarded YubiKey sent unknown message {other}"
-                )));
-            }
-        }
-    }
+    FORWARDING
+        .request(stream, &message, |stream| {
+            let mut response = Zeroizing::new([0u8; RESPONSE_LEN]);
+            stream.read_exact(&mut response[..])?;
+            Ok(response)
+        })
+        .map(Some)
 }
 
 /// Answer challenges for the key plugged into this machine until killed.
@@ -174,78 +84,16 @@ fn request(
 ///
 /// Fails when the socket cannot be created, or another `serve` already owns it.
 pub fn serve(path: &Path) -> AppResult<()> {
-    let listener = bind(path)?;
-    println!("Answering YubiKey challenges on {}", path.display());
-    println!(
-        "Forward it with: ssh -R <remote path>:{} <host>",
-        path.display()
-    );
-    for stream in listener.incoming().flatten() {
-        match answer(stream) {
-            // A client that connected and left, e.g. another `serve` probing.
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
-            Err(err) => warn!("YubiKey request failed: {err}"),
-            Ok(()) => {}
+    FORWARDING.serve(path, |stream, touch| {
+        let mut message = [0u8; REQUEST_LEN];
+        stream.read_exact(&mut message)?;
+        let result = parse_request(&message)
+            .and_then(|(slot, padded)| local_challenge(slot, &padded, &mut || touch()));
+        match result {
+            Ok(response) => reply(stream, Ok(&response[..])),
+            Err(err) => reply(stream, Err(err)),
         }
-    }
-    Ok(())
-}
-
-fn bind(path: &Path) -> AppResult<UnixListener> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if !meta.file_type().is_socket() {
-            return Err(AppError::InvalidInput(format!(
-                "{} exists and is not a socket",
-                path.display()
-            )));
-        }
-        if UnixStream::connect(path).is_ok() {
-            return Err(AppError::InvalidInput(format!(
-                "another 'keepassxcr yubikey serve' is already answering on {}",
-                path.display()
-            )));
-        }
-        // Left over from a server that was killed.
-        fs::remove_file(path)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
-}
-
-fn answer(mut stream: UnixStream) -> io::Result<()> {
-    if peer_uid(&stream)? != current_uid() {
-        return Ok(());
-    }
-    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-    let mut message = [0u8; REQUEST_LEN];
-    stream.read_exact(&mut message)?;
-    let result = parse_request(&message).and_then(|(slot, padded)| {
-        let mut notify = stream.try_clone()?;
-        local_challenge(slot, &padded, &mut || {
-            eprintln!("{TOUCH_PROMPT}");
-            let _ = notify.write_all(&[MSG_TOUCH]);
-        })
-    });
-    match result {
-        Ok(response) => {
-            let mut reply = Zeroizing::new([0u8; 1 + RESPONSE_LEN]);
-            reply[0] = MSG_OK;
-            reply[1..].copy_from_slice(&response[..]);
-            stream.write_all(&reply[..])
-        }
-        Err(err) => {
-            let text = match err {
-                AppError::YubiKey(message) => message,
-                other => other.to_string(),
-            };
-            let text = &text.as_bytes()[..text.len().min(usize::from(u16::MAX))];
-            let mut reply = vec![MSG_ERROR];
-            reply.extend_from_slice(&(text.len() as u16).to_be_bytes());
-            reply.extend_from_slice(text);
-            stream.write_all(&reply)
-        }
-    }
+    })
 }
 
 fn parse_request(message: &[u8; REQUEST_LEN]) -> AppResult<(YubiKeySlot, [u8; CHALLENGE_LEN])> {
