@@ -10,10 +10,10 @@ build:
 release:
     cargo build --release
 
-# Run the Rust unit and integration tests (YubiKey tests use an emulated key)
+# Run the Rust unit and integration tests (YubiKey and FIDO2 tests use emulated devices)
 [positional-arguments]
 test *args:
-    cargo test --features software-yubikey "$@"
+    cargo test --features software-yubikey,software-fido2 "$@"
 
 # Run the Python compatibility suite against keepassxc-cli (add --log-cli-level=DEBUG to see command output)
 [positional-arguments]

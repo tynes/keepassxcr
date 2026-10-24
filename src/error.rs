@@ -38,6 +38,10 @@ pub enum AppError {
     #[error("YubiKey: {0}")]
     YubiKey(String),
 
+    /// FIDO2 security key (hmac-secret) failures.
+    #[error("FIDO2: {0}")]
+    Fido2(String),
+
     /// The database's agent unlock expired; the command refuses to prompt.
     #[error("{0}")]
     Locked(String),

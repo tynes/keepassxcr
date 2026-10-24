@@ -2,6 +2,8 @@
 
 mod byteio;
 #[cfg(unix)]
+pub mod forward;
+#[cfg(unix)]
 pub mod unix;
 
 pub use byteio::{
