@@ -50,6 +50,8 @@ pub struct Emulator {
     assembler: Assembler,
     outbox: VecDeque<Packet>,
     key_agreement: Option<EphemeralSecret>,
+    /// Refuse `"up": false` assertions, like a device that always wants a touch.
+    refuse_silent: bool,
 }
 
 impl Emulator {
@@ -60,7 +62,15 @@ impl Emulator {
             assembler: Assembler::default(),
             outbox: VecDeque::new(),
             key_agreement: None,
+            refuse_silent: false,
         }
+    }
+
+    /// This device, refusing assertions without user presence.
+    #[cfg(test)]
+    pub fn refusing_silent_assertions(mut self) -> Self {
+        self.refuse_silent = true;
+        self
     }
 
     /// The device configured in `KEEPASSXCR_SOFTWARE_FIDO2`, if set.
@@ -175,11 +185,15 @@ impl Emulator {
             .and_then(Value::as_text)
             .ok_or(ERR_INVALID_CBOR)?
             .to_string();
+        let options = get(request, 5).and_then(Value::as_map);
         // A real Ledger answers differently with `uv`; refusing it here keeps
         // keepassxcr from ever sending it.
-        if let Some(options) = get(request, 5).and_then(Value::as_map)
-            && get_text(options, "uv").is_some()
-        {
+        if options.is_some_and(|options| get_text(options, "uv").is_some()) {
+            return Err(ERR_UNSUPPORTED_OPTION);
+        }
+        let silent =
+            options.is_some_and(|options| get_text(options, "up") == Some(&Value::Bool(false)));
+        if silent && self.refuse_silent {
             return Err(ERR_UNSUPPORTED_OPTION);
         }
         let credential_id = get(request, 3)
@@ -215,14 +229,17 @@ impl Emulator {
         {
             return Err(ERR_PIN_AUTH_INVALID);
         }
-        self.queue(CID, CMD_KEEPALIVE, &[STATUS_UPNEEDED]);
+        if !silent {
+            self.queue(CID, CMD_KEEPALIVE, &[STATUS_UPNEEDED]);
+        }
 
         let salt = ctap::aes_cbc(&shared, &salt_enc, false);
         let cred_random = Zeroizing::new(self.mac(b"cred", &credential_id));
         let output = Zeroizing::new(hmac_sha256(&cred_random[..], &salt).map_err(|_| 0x01u8)?);
         let encrypted = ctap::aes_cbc(&shared, &output, true);
 
-        let mut auth_data = auth_data_header(&rp_id, 0x01 | FLAG_ED);
+        // Flag bit 0 (UP) says whether the user confirmed.
+        let mut auth_data = auth_data_header(&rp_id, u8::from(!silent) | FLAG_ED);
         let extensions = Value::Map(vec![(text(HMAC_SECRET), Value::Bytes(encrypted.to_vec()))]);
         let _ = ciborium::into_writer(&extensions, &mut auth_data);
         Ok(vec![

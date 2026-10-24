@@ -15,12 +15,26 @@ All notable changes to this project are listed here. The format follows
   salt live in the `PublicCustomData` header, which KeePassXC keeps when it
   saves. On a Ledger the credential comes from the seed, so a Ledger restored
   from the same 24 words opens the database.
+- Commands use the device of a database set up for one without `--fido2`,
+  as its header says so; `--fido2` only insists on the device.
+- The device stands in for the password: `db-create --fido2` asks for none,
+  and a database set up with the device alone asks for none when opened.
+  Whether a database also has a password is recorded next to its FIDO2
+  settings and kept in step by `db-edit`. Registering asks for one
+  confirmation when the device answers the secret request without a second.
 - `db-create --fido2`, `db-edit --new-fido2` / `--unset-fido2` and
   `merge --fido2-from` set up, remove and use a FIDO2 device, and `db-info`
   shows which credential a database uses. With several devices plugged in,
   the one confirmed on is used.
 - `fido2 serve` answers FIDO2 requests forwarded from another machine over a
   socket, like `yubikey serve`.
+
+### Changed
+
+- Database paths get the `.kdbx` extension when they lack it, for every
+  command: `db-create vault` creates `vault.kdbx`, and `ls vault` reads it.
+  A database with another extension must be renamed to end in `.kdbx`:
+  `vault.db` now means `vault.db.kdbx`.
 
 ## [0.3.1] - 2026-10-18
 

@@ -94,13 +94,19 @@ pub(crate) fn fido2_error(message: impl Into<String>) -> Failure {
 
 /// Register a FIDO2 device for a database: the device makes a credential,
 /// keepassxcr draws a salt, and the device derives the database's secret.
-/// The user confirms twice on the device.
+/// The user confirms once on the device, or twice when the device will not
+/// derive the secret without a second confirmation.
+///
+/// # Arguments
+///
+/// * `password` - Whether the database also has a password, recorded so
+///   unlocking only asks for one when it does
 ///
 /// # Errors
 ///
 /// Fails when no device is reachable, the user declines, or the device lacks
 /// hmac-secret.
-pub fn enroll() -> AppResult<(Fido2Config, Secret)> {
+pub fn enroll(password: bool) -> AppResult<(Fido2Config, Secret)> {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     #[cfg(unix)]
@@ -115,6 +121,7 @@ pub fn enroll() -> AppResult<(Fido2Config, Secret)> {
         rp_id: RP_ID.to_string(),
         credential_id,
         salt,
+        password,
     };
     Ok((config, secret))
 }
@@ -143,18 +150,42 @@ fn local_enroll(
     salt: &[u8; SALT_LEN],
     on_touch: &(dyn Fn() + Sync),
 ) -> AppResult<(Vec<u8>, Secret)> {
-    let (mut device, credential_id) = race(devices()?, |device, cancel| {
+    enroll_one_of(devices()?, rp_id, salt, on_touch)
+}
+
+/// Enroll whichever of `devices` the user confirms on.
+fn enroll_one_of(
+    devices: Vec<Device>,
+    rp_id: &str,
+    salt: &[u8; SALT_LEN],
+    on_touch: &(dyn Fn() + Sync),
+) -> AppResult<(Vec<u8>, Secret)> {
+    let (mut device, credential_id) = race(devices, |device, cancel| {
         ctap::make_credential(device, rp_id, cancel, on_touch)
     })?;
-    // The same device, which now holds the credential.
-    let secret = ctap::hmac_secret(
-        &mut device,
-        rp_id,
-        &credential_id,
-        salt,
-        &AtomicBool::new(false),
-        on_touch,
-    )
+    // The same device, which now holds the credential. The user has just
+    // confirmed on it, so ask for the secret without a second confirmation
+    // first; a device that will not answer that way is asked again normally.
+    let no_cancel = AtomicBool::new(false);
+    // `FnMut`: the closure keeps a mutable borrow of `device` between calls.
+    let mut assert = |user_presence| {
+        ctap::hmac_secret(
+            &mut device,
+            rp_id,
+            &credential_id,
+            salt,
+            user_presence,
+            &no_cancel,
+            on_touch,
+        )
+    };
+    let secret = match assert(false) {
+        Err(Failure::Error(err)) => {
+            tracing::debug!("silent hmac-secret failed ({err}); asking for a confirmation");
+            assert(true)
+        }
+        result => result,
+    }
     .map_err(|failure| into_error(failure, "the device lost the new credential"))?;
     Ok((credential_id, secret))
 }
@@ -167,7 +198,7 @@ fn local_secret(
     on_touch: &(dyn Fn() + Sync),
 ) -> AppResult<Secret> {
     race(devices()?, |device, cancel| {
-        ctap::hmac_secret(device, rp_id, credential_id, salt, cancel, on_touch)
+        ctap::hmac_secret(device, rp_id, credential_id, salt, true, cancel, on_touch)
     })
     .map(|(_, secret)| secret)
 }
@@ -257,6 +288,8 @@ fn print_touch_prompt() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
     use crate::fido2::emulator::Emulator;
 
@@ -265,19 +298,43 @@ mod tests {
     }
 
     fn enroll_on(master: &[u8], salt: &[u8; SALT_LEN]) -> (Vec<u8>, Secret) {
-        let mut device = emulated(master);
-        let id = ctap::make_credential(&mut device, RP_ID, &AtomicBool::new(false), &|| {})
-            .expect("make credential");
-        let secret = ctap::hmac_secret(
-            &mut device,
-            RP_ID,
-            &id,
-            salt,
-            &AtomicBool::new(false),
-            &|| {},
-        )
-        .expect("hmac-secret");
-        (id, secret)
+        enroll_one_of(vec![emulated(master)], RP_ID, salt, &|| {})
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Enroll `emulator`: the credential id, secret, and confirmations asked for.
+    fn enroll_counting_touches(emulator: Emulator) -> (Vec<u8>, Secret, usize) {
+        let touches = AtomicUsize::new(0);
+        let device = Device::open(Box::new(emulator)).expect("open emulator");
+        let (id, secret) = enroll_one_of(vec![device], RP_ID, &[3u8; SALT_LEN], &|| {
+            touches.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap_or_else(|err| panic!("{err}"));
+        (id, secret, touches.into_inner())
+    }
+
+    /// The secret a normal, confirmed unlock gets for `id`.
+    fn unlock_secret(master: &[u8], id: &[u8]) -> Secret {
+        race(vec![emulated(master)], |device, cancel| {
+            ctap::hmac_secret(device, RP_ID, id, &[3u8; SALT_LEN], true, cancel, &|| {})
+        })
+        .unwrap_or_else(|err| panic!("{err}"))
+        .1
+    }
+
+    #[test]
+    fn enrolling_asks_for_one_confirmation() {
+        let (id, secret, touches) = enroll_counting_touches(Emulator::new(b"seed".to_vec()));
+        assert_eq!(touches, 1);
+        assert_eq!(*secret, *unlock_secret(b"seed", &id));
+    }
+
+    #[test]
+    fn enrolling_asks_again_when_the_device_refuses_a_silent_answer() {
+        let emulator = Emulator::new(b"seed".to_vec()).refusing_silent_assertions();
+        let (id, secret, touches) = enroll_counting_touches(emulator);
+        assert_eq!(touches, 2);
+        assert_eq!(*secret, *unlock_secret(b"seed", &id));
     }
 
     #[test]
@@ -285,14 +342,14 @@ mod tests {
         let salt = [5u8; SALT_LEN];
         let (id, first) = enroll_on(b"seed", &salt);
         let again = race(vec![emulated(b"seed")], |device, cancel| {
-            ctap::hmac_secret(device, RP_ID, &id, &salt, cancel, &|| {})
+            ctap::hmac_secret(device, RP_ID, &id, &salt, true, cancel, &|| {})
         })
         .unwrap_or_else(|err| panic!("{err}"))
         .1;
         assert_eq!(*first, *again);
 
         let other_salt = race(vec![emulated(b"seed")], |device, cancel| {
-            ctap::hmac_secret(device, RP_ID, &id, &[6u8; SALT_LEN], cancel, &|| {})
+            ctap::hmac_secret(device, RP_ID, &id, &[6u8; SALT_LEN], true, cancel, &|| {})
         })
         .unwrap_or_else(|err| panic!("{err}"))
         .1;
@@ -316,7 +373,7 @@ mod tests {
         let (id, secret) = enroll_on(b"right", &salt);
         let devices = vec![emulated(b"wrong"), emulated(b"right"), emulated(b"other")];
         let (_, answer) = race(devices, |device, cancel| {
-            ctap::hmac_secret(device, RP_ID, &id, &salt, cancel, &|| {})
+            ctap::hmac_secret(device, RP_ID, &id, &salt, true, cancel, &|| {})
         })
         .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(*answer, *secret);
@@ -326,7 +383,7 @@ mod tests {
     fn a_device_without_the_credential_is_reported() {
         let (id, _) = enroll_on(b"right", &[1u8; SALT_LEN]);
         let err = race(vec![emulated(b"wrong")], |device, cancel| {
-            ctap::hmac_secret(device, RP_ID, &id, &[1u8; SALT_LEN], cancel, &|| {})
+            ctap::hmac_secret(device, RP_ID, &id, &[1u8; SALT_LEN], true, cancel, &|| {})
         })
         .err()
         .map(|err| err.to_string())

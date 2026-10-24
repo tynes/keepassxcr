@@ -214,19 +214,32 @@ U2F), as does a YubiKey 5 or any other key with `hmac-secret` (a key with a FIDO
 to register, as keepassxcr cannot send a PIN yet).
 
 ```sh
-keepassxcr db-create --fido2 passwords.kdbx            # register the device (confirm twice)
-keepassxcr show --fido2 passwords.kdbx Email/Gmail
+keepassxcr db-create --fido2 passwords                 # register the device; creates passwords.kdbx
+keepassxcr show passwords Email/Gmail                   # uses the device; no password prompt
 keepassxcr db-edit passwords.kdbx --new-fido2           # add a device to a database
-keepassxcr db-edit --fido2 passwords.kdbx --unset-fido2 # remove it
-keepassxcr unlock --fido2 passwords.kdbx                # confirm once, then no device needed
+keepassxcr db-edit passwords --unset-fido2             # remove it
+keepassxcr unlock passwords                             # confirm once, then no device needed
 ```
 
 Setting up registers a credential on the device and draws a random salt; to unlock, the device
 derives a fixed 32-byte secret from the two after you confirm on it. The secret takes the place
-of a key file, so `--fido2` cannot be combined with `--key-file`; a password and a YubiKey can be
-added as usual. The credential id and salt are not secret and are stored in the database's
-unencrypted KDBX 4 header (`PublicCustomData`), so `--fido2` needs a KDBX 4 database. Saving
-does not ask the device again.
+of a key file, so `--fido2` cannot be combined with `--key-file`. Once a database is set up for a
+device, every command uses the device without `--fido2`, since the header says so; passing it
+only insists on the device and skips the unlock agent. The device also stands in for the
+password: `db-create --fido2` asks for none, and a database set up with the device alone asks for
+none when it is opened. To require a password as well, give one when creating
+(`db-create --fido2 --password ...`) or add one later with `db-edit --new-password ...`;
+keepassxcr then asks for it on every unlock, or reads it from stdin. A YubiKey can be added as
+usual. The credential id, salt and whether there is also a password are not secret and are stored
+in the database's unencrypted KDBX 4 header (`PublicCustomData`), so `--fido2` needs a KDBX 4
+database. Saving does not ask the device again.
+
+Registering asks for one confirmation where the device allows it: right after you confirm the new
+credential, keepassxcr asks the device for the secret with `"up": false`, which needs no second
+confirmation. By the CTAP2 spec the secret depends on user verification, not presence, so it
+matches later unlocks; this has not been tested on a Ledger yet, so create a test database and
+check that it opens before you rely on it. A device that refuses, or ignores the option, asks for
+a second confirmation instead.
 
 With several FIDO2 devices plugged in, each is asked and the one you confirm on is used.
 

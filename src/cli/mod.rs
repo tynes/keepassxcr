@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use clap::builder::{PathBufValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 
 use crate::error::{AppError, AppResult};
@@ -129,7 +130,10 @@ pub struct CredentialArgs {
     #[arg(short = 'y', long, value_name = "SLOT[:SERIAL]")]
     pub yubikey: Option<YubiKeySlot>,
     /// Use a FIDO2 device (e.g. a Ledger running the Security Key app). It
-    /// takes the place of a key file.
+    /// takes the place of a key file, and of the password: a database set
+    /// up with the device alone asks for no password. A database set up for
+    /// a device uses it without this flag; with it, the device is required
+    /// and the unlock agent is skipped.
     #[arg(long, conflicts_with = "key_file")]
     pub fido2: bool,
     /// Ignore the unlock agent and ask for credentials.
@@ -140,7 +144,8 @@ pub struct CredentialArgs {
 /// Open a database with credentials.
 #[derive(Debug, Args, Clone)]
 pub struct DbOpenArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     #[command(flatten)]
@@ -150,7 +155,8 @@ pub struct DbOpenArgs {
 /// Unlock arguments.
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     /// Lock after this long without use (e.g. 90s, 15m, 1h).
@@ -211,7 +217,8 @@ pub struct Fido2ServeArgs {
 /// Lock and status arguments.
 #[derive(Debug, Args)]
 pub struct LockArgs {
-    /// Path to the database file. Omit for every unlocked database.
+    /// Path to the database file; .kdbx is added when missing. Omit for every unlocked database.
+    #[arg(value_parser = database_path())]
     pub database: Option<PathBuf>,
 }
 
@@ -231,7 +238,8 @@ pub struct AgentArgs {
 /// Create database arguments.
 #[derive(Debug, Args)]
 pub struct DbCreateArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     #[command(flatten)]
@@ -253,7 +261,8 @@ pub struct DbCreateArgs {
 /// Edit database arguments.
 #[derive(Debug, Args)]
 pub struct DbEditArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     #[command(flatten)]
@@ -287,9 +296,11 @@ pub struct DbEditArgs {
 /// Merge two databases.
 #[derive(Debug, Args)]
 pub struct MergeArgs {
-    /// Target database path.
+    /// Target database path; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
-    /// Source database path to merge.
+    /// Source database path to merge; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub source: PathBuf,
 
     #[command(flatten)]
@@ -306,7 +317,8 @@ pub struct MergeArgs {
     /// YubiKey slot and optional serial for the source database.
     #[arg(long = "yubikey-from", value_name = "SLOT[:SERIAL]")]
     pub source_yubikey: Option<YubiKeySlot>,
-    /// Use a FIDO2 device for the source database.
+    /// Require a FIDO2 device for the source database (used anyway when the
+    /// source is set up for one).
     #[arg(long = "fido2-from", conflicts_with = "source_key_file")]
     pub source_fido2: bool,
 }
@@ -314,7 +326,8 @@ pub struct MergeArgs {
 /// Export database arguments.
 #[derive(Debug, Args)]
 pub struct DbExportArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     #[command(flatten)]
@@ -326,7 +339,8 @@ pub struct DbExportArgs {
 pub struct DbImportArgs {
     /// Input XML file.
     pub xml: PathBuf,
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
 
     #[command(flatten)]
@@ -336,7 +350,8 @@ pub struct DbImportArgs {
 /// Entry path arguments.
 #[derive(Debug, Args)]
 pub struct EntryPathArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -348,7 +363,8 @@ pub struct EntryPathArgs {
 /// Add entry arguments.
 #[derive(Debug, Args)]
 pub struct EntryAddArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -381,7 +397,8 @@ pub struct EntryAddArgs {
 /// Edit entry arguments.
 #[derive(Debug, Args)]
 pub struct EntryEditArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -417,7 +434,8 @@ pub struct EntryEditArgs {
 /// Show entry arguments.
 #[derive(Debug, Args)]
 pub struct EntryShowArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -443,7 +461,8 @@ pub struct EntryShowArgs {
 /// Group path arguments.
 #[derive(Debug, Args)]
 pub struct GroupPathArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Group path (Group/Subgroup). Defaults to root.
     pub group: Option<String>,
@@ -455,7 +474,8 @@ pub struct GroupPathArgs {
 /// Group creation arguments.
 #[derive(Debug, Args)]
 pub struct GroupCreateArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Group path to create.
     pub group: String,
@@ -467,7 +487,8 @@ pub struct GroupCreateArgs {
 /// Move entry arguments.
 #[derive(Debug, Args)]
 pub struct EntryMoveArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -481,7 +502,8 @@ pub struct EntryMoveArgs {
 /// Search arguments.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Search term.
     pub term: String,
@@ -493,7 +515,8 @@ pub struct SearchArgs {
 /// Attachment import arguments.
 #[derive(Debug, Args)]
 pub struct AttachmentImportArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -509,7 +532,8 @@ pub struct AttachmentImportArgs {
 /// Attachment export arguments.
 #[derive(Debug, Args)]
 pub struct AttachmentExportArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -525,7 +549,8 @@ pub struct AttachmentExportArgs {
 /// Attachment remove arguments.
 #[derive(Debug, Args)]
 pub struct AttachmentRemoveArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -539,7 +564,8 @@ pub struct AttachmentRemoveArgs {
 /// `ssh-add` arguments.
 #[derive(Debug, Args)]
 pub struct SshAddArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entries holding SSH keys (Group/Entry).
     #[arg(required_unless_present_any = ["all", "list"])]
@@ -569,7 +595,8 @@ pub struct SshAddArgs {
 /// `ssh-key-import` arguments.
 #[derive(Debug, Args)]
 pub struct SshKeyImportArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry to store the key in (Group/Entry); its password must be the key's
     /// passphrase, or empty for an unencrypted key.
@@ -600,7 +627,8 @@ pub struct SshKeyImportArgs {
 /// Clip arguments.
 #[derive(Debug, Args)]
 pub struct ClipArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Entry path (Group/Entry).
     pub entry: String,
@@ -616,7 +644,8 @@ pub struct ClipArgs {
 /// Analyze arguments.
 #[derive(Debug, Args)]
 pub struct AnalyzeArgs {
-    /// Path to the database file.
+    /// Path to the database file; .kdbx is added when missing.
+    #[arg(value_parser = database_path())]
     pub database: PathBuf,
     /// Path to HIBP SHA-1 hash list.
     #[arg(long, value_name = "FILE")]
@@ -683,6 +712,24 @@ impl CredentialArgs {
     }
 }
 
+/// Parser for database path arguments: adds the `.kdbx` extension when it is
+/// missing, so `db-create vault` and `ls vault` both use `vault.kdbx`.
+fn database_path() -> impl TypedValueParser<Value = PathBuf> {
+    PathBufValueParser::new().map(with_kdbx_extension)
+}
+
+/// `path` with `.kdbx` appended unless it already ends in `.kdbx` (any case).
+fn with_kdbx_extension(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kdbx"))
+    {
+        // Appends to the raw OS string, so non-UTF-8 paths stay intact.
+        path.as_mut_os_string().push(".kdbx");
+    }
+    path
+}
+
 fn init_tracing(verbose: bool) {
     let level = if verbose {
         tracing::Level::DEBUG
@@ -693,4 +740,37 @@ fn init_tracing(verbose: bool) {
         .with_max_level(level)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_paths_get_the_kdbx_extension() {
+        let cases = [
+            ("vault", "vault.kdbx"),
+            ("dir/vault", "dir/vault.kdbx"),
+            ("vault.kdbx", "vault.kdbx"),
+            ("Vault.KDBX", "Vault.KDBX"),
+            ("vault.db", "vault.db.kdbx"),
+        ];
+        for (given, expected) in cases {
+            assert_eq!(
+                with_kdbx_extension(PathBuf::from(given)),
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn the_cli_resolves_database_arguments() {
+        let cli =
+            Cli::try_parse_from(["keepassxcr", "merge", "target", "source.kdbx"]).expect("parse");
+        let Command::Merge(args) = cli.command else {
+            panic!("parsed as another command");
+        };
+        assert_eq!(args.database, PathBuf::from("target.kdbx"));
+        assert_eq!(args.source, PathBuf::from("source.kdbx"));
+    }
 }

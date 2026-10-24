@@ -166,12 +166,22 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
     let credentials = build_credentials(&args.database, &args.credentials)?;
     let mut target = read_kdbx(&args.database, &credentials)?;
 
+    let source_fido2 = unlock_fido2_config(
+        &args.source,
+        args.source_fido2,
+        args.source_key_file.as_deref(),
+    )?;
+    // Ask for a password unless a key file, or a FIDO2 device set up without
+    // one, unlocks the source on its own.
+    let ask_password = source_fido2
+        .as_ref()
+        .map_or(args.source_key_file.is_none(), |config| config.password);
     let source_password = match args.source_password {
         Some(password) => {
             warn_password_argument();
             Some(SecretString::new(password))
         }
-        None if args.source_key_file.is_none() && !args.source_fido2 => {
+        None if ask_password => {
             let password = read_secret("Password for source database: ")?;
             (!password.is_empty()).then(|| into_secret(password))
         }
@@ -179,13 +189,13 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
     };
     let source_credentials = Credentials {
         password: source_password,
-        key_file: if args.source_fido2 {
-            Some(fido2_key_file(&args.source)?)
-        } else {
-            args.source_key_file
+        key_file: match &source_fido2 {
+            Some(config) => Some(fido2_key_file(config)?),
+            None => args
+                .source_key_file
                 .as_ref()
                 .map(|path| KeyFile::load(path))
-                .transpose()?
+                .transpose()?,
         },
         yubikey: args.source_yubikey,
         agent: None,
@@ -897,14 +907,16 @@ fn build_local_credentials(
     database: &Path,
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<Credentials> {
-    let mut credentials = build_credentials_with(args, &unlock_prompt(database), false)?;
-    if args.fido2 {
-        credentials.key_file = Some(fido2_key_file(database)?);
-    } else if args.key_file.is_none() && matches!(fido2_config(database), Ok(Some(_))) {
-        warn!(
-            "{} is set up for a FIDO2 device; pass --fido2 to use it",
-            database.display()
-        );
+    let fido2 = unlock_fido2_config(database, args.fido2, args.key_file.as_deref())?;
+    // A database set up with the FIDO2 device alone has no password to ask for.
+    let prompt = unlock_prompt(database);
+    let prompt = fido2
+        .as_ref()
+        .is_none_or(|config| config.password)
+        .then_some(prompt.as_str());
+    let mut credentials = build_credentials_with(args, prompt, false)?;
+    if let Some(config) = &fido2 {
+        credentials.key_file = Some(fido2_key_file(config)?);
     }
     Ok(credentials)
 }
@@ -921,13 +933,15 @@ fn unlock_prompt(database: &Path) -> String {
 
 /// Build credentials for a new database, asking twice for a prompted
 /// password. With `--fido2`, set up a FIDO2 device and also return the
-/// `PublicCustomData` header holding its settings.
+/// `PublicCustomData` header holding its settings; the device then stands in
+/// for the password, so there is none unless `--password` gives one.
 fn build_new_database_credentials(
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<(Credentials, Option<Vec<u8>>)> {
-    let mut credentials = build_credentials_with(args, "Password: ", true)?;
+    let prompt = (!args.fido2).then_some("Password: ");
+    let mut credentials = build_credentials_with(args, prompt, true)?;
     let public_custom_data = if args.fido2 {
-        let (config, secret) = fido2::enroll()?;
+        let (config, secret) = fido2::enroll(credentials.password.is_some())?;
         credentials.key_file = Some(KeyFile::from_raw(&secret));
         Some(config.store(None)?)
     } else {
@@ -942,29 +956,48 @@ fn fido2_config(database: &Path) -> AppResult<Option<Fido2Config>> {
     Fido2Config::from_public_custom_data(header.public_custom_data.as_deref())
 }
 
-/// Ask `database`'s FIDO2 device for its secret, as a key file.
-fn fido2_key_file(database: &Path) -> AppResult<KeyFile> {
-    let config = fido2_config(database)?.ok_or_else(|| {
-        AppError::InvalidInput(format!(
+/// The FIDO2 settings to unlock `database` with, from its header: so the
+/// device is used without `--fido2`, unless a key file takes its place.
+///
+/// # Errors
+///
+/// Fails when the header cannot be read, or `fido2` (`--fido2`) is set and
+/// the database is not set up for a device.
+fn unlock_fido2_config(
+    database: &Path,
+    fido2: bool,
+    key_file: Option<&Path>,
+) -> AppResult<Option<Fido2Config>> {
+    if key_file.is_some() {
+        return Ok(None);
+    }
+    let config = fido2_config(database)?;
+    if fido2 && config.is_none() {
+        return Err(AppError::InvalidInput(format!(
             "{} is not set up for a FIDO2 device; set one up with 'keepassxcr db-edit --new-fido2'",
             database.display()
-        ))
-    })?;
-    Ok(KeyFile::from_raw(&*fido2::secret(&config)?))
+        )));
+    }
+    Ok(config)
 }
 
+/// Ask the FIDO2 device set up with `config` for its secret, as a key file.
+fn fido2_key_file(config: &Fido2Config) -> AppResult<KeyFile> {
+    Ok(KeyFile::from_raw(&*fido2::secret(config)?))
+}
+
+/// Build credentials from `args`. With no password option, the password is
+/// read with `prompt`, or left out when `prompt` is `None`.
 fn build_credentials_with(
     args: &crate::cli::CredentialArgs,
-    prompt: &str,
+    prompt: Option<&str>,
     confirm: bool,
 ) -> AppResult<Credentials> {
     args.validate()?;
     let password = if let Some(pass) = &args.password {
         warn_password_argument();
         Some(SecretString::new(pass.clone()))
-    } else if args.no_password {
-        None
-    } else {
+    } else if let Some(prompt) = prompt.filter(|_| !args.no_password) {
         let prompt = read_secret(prompt)?;
         if confirm && !prompt.is_empty() {
             let repeat = read_secret("Repeat password: ")?;
@@ -977,6 +1010,8 @@ fn build_credentials_with(
         } else {
             Some(into_secret(prompt))
         }
+    } else {
+        None
     };
 
     let key_file = args
@@ -1037,6 +1072,10 @@ fn build_new_credentials(
         current.password.clone()
     };
 
+    // Unlocking used the device, and its secret is the current key file,
+    // unless a key file was given in its place.
+    let unlocked_with_fido2 = args.credentials.key_file.is_none()
+        && Fido2Config::from_public_custom_data(file.public_custom_data.as_deref())?.is_some();
     // The FIDO2 secret takes the key-file slot, so a new key file replaces it too.
     if args.new_key_file.is_some() || args.unset_fido2 {
         file.public_custom_data = Fido2Config::remove(file.public_custom_data.as_deref())?;
@@ -1049,10 +1088,10 @@ fn build_new_credentials(
                 "--new-fido2 needs a KDBX 4 database".to_string(),
             ));
         }
-        let (config, secret) = fido2::enroll()?;
+        let (config, secret) = fido2::enroll(password.is_some())?;
         file.public_custom_data = Some(config.store(file.public_custom_data.as_deref())?);
         Some(KeyFile::from_raw(&secret))
-    } else if args.unset_fido2 && args.credentials.fido2 {
+    } else if args.unset_fido2 && unlocked_with_fido2 {
         None
     } else {
         current.key_file.clone()
@@ -1063,6 +1102,17 @@ fn build_new_credentials(
     } else {
         args.new_yubikey.or(current.yubikey)
     };
+
+    // Keep the FIDO2 settings' password flag in step with the new
+    // password, so unlocking asks for one exactly when there is one.
+    if !args.new_fido2
+        && let Some(mut config) =
+            Fido2Config::from_public_custom_data(file.public_custom_data.as_deref())?
+        && config.password != password.is_some()
+    {
+        config.password = password.is_some();
+        file.public_custom_data = Some(config.store(file.public_custom_data.as_deref())?);
+    }
 
     Ok(Credentials {
         password,

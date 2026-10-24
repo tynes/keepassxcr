@@ -120,6 +120,139 @@ fn creates_and_opens_with_the_device() {
         .stdout(contains("FIDO2: credential "));
 }
 
+/// How many times `stderr` asked for a confirmation on the device.
+fn touches(stderr: &[u8]) -> usize {
+    String::from_utf8_lossy(stderr)
+        .matches(TOUCH_PROMPT)
+        .count()
+}
+
+#[test]
+fn creating_asks_for_one_confirmation() {
+    let fixture = Fixture::new("one");
+    let output = fixture
+        .with_device(SEED, "db-create", &["--kdf", "aes-kdf", "--fido2"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    assert_eq!(touches(&output), 1);
+}
+
+#[test]
+fn a_device_alone_asks_for_no_password() {
+    let fixture = Fixture::new("alone");
+    fixture
+        .with_device(SEED, "db-create", &["--kdf", "aes-kdf", "--fido2"])
+        .assert()
+        .success()
+        .stderr(contains("Password").not());
+    // A prompt would read this line as the password and fail to open.
+    fixture
+        .with_device(SEED, "add", &["Api", "--username", "alice", "--fido2"])
+        .write_stdin("not-the-password\n")
+        .assert()
+        .success();
+    fixture
+        .with_device(SEED, "show", &["Api", "--fido2"])
+        .write_stdin("not-the-password\n")
+        .assert()
+        .success()
+        .stdout(contains("alice"))
+        .stderr(contains("Enter password").not());
+    fixture
+        .with_device(SEED, "db-info", &["--fido2"])
+        .assert()
+        .success()
+        .stdout(contains("FIDO2: credential "));
+}
+
+#[test]
+fn a_password_and_device_database_still_asks_for_the_password() {
+    let fixture = Fixture::new("both");
+    fixture.create();
+    fixture
+        .with_device(SEED, "show", &["Api", "--fido2"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success()
+        .stdout(contains("alice"));
+    fixture
+        .with_device(SEED, "show", &["Api", "--fido2"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn db_edit_keeps_track_of_the_password() {
+    let fixture = Fixture::new("pwflag");
+    fixture
+        .with_device(SEED, "db-create", &["--kdf", "aes-kdf", "--fido2"])
+        .assert()
+        .success();
+
+    fixture
+        .with_device(SEED, "db-edit", &["--fido2", "--new-password", PASSWORD])
+        .assert()
+        .success();
+    fixture
+        .with_device(SEED, "ls", &["--fido2"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success();
+    fixture
+        .with_device(SEED, "ls", &["--fido2"])
+        .assert()
+        .failure();
+
+    fixture
+        .with_device(SEED, "db-edit", &["--fido2", "--new-no-password"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success();
+    fixture
+        .with_device(SEED, "ls", &["--fido2"])
+        .write_stdin("not-the-password\n")
+        .assert()
+        .success();
+}
+
+#[test]
+fn merge_asks_for_a_source_password_only_when_it_has_one() {
+    let target = Fixture::new("mtarget");
+    target
+        .with_device(
+            SEED,
+            "db-create",
+            &["--kdf", "aes-kdf", "--password", PASSWORD],
+        )
+        .assert()
+        .success();
+    let source = Fixture::new("msource");
+    source.create();
+    let alone = Fixture::new("malone");
+    alone
+        .with_device(SEED, "db-create", &["--kdf", "aes-kdf", "--fido2"])
+        .assert()
+        .success();
+
+    // The target's password comes from --password; stdin answers the source's prompt.
+    for (from, stdin) in [
+        (&source, format!("{PASSWORD}\n")),
+        (&alone, "not-the-password\n".to_string()),
+    ] {
+        target
+            .with_device(SEED, "merge", &[])
+            .arg(&from.db)
+            .args(["--password", PASSWORD, "--fido2-from"])
+            .write_stdin(stdin)
+            .assert()
+            .success()
+            .stdout(contains("Merged"));
+    }
+}
+
 #[test]
 fn needs_the_device() {
     let fixture = Fixture::new("need");
@@ -128,7 +261,46 @@ fn needs_the_device() {
         .without_device("ls", &["--password", PASSWORD])
         .assert()
         .failure()
-        .stderr(contains("pass --fido2"));
+        .stderr(contains("no FIDO2 device found"));
+}
+
+#[test]
+fn the_header_says_to_use_the_device() {
+    let alone = Fixture::new("infer");
+    alone
+        .with_device(SEED, "db-create", &["--kdf", "aes-kdf", "--fido2"])
+        .assert()
+        .success();
+    alone
+        .with_device(SEED, "ls", &[])
+        .write_stdin("not-the-password\n")
+        .assert()
+        .success()
+        .stderr(contains(TOUCH_PROMPT))
+        .stderr(contains("Enter password").not());
+
+    let both = Fixture::new("inferpw");
+    both.create();
+    both.with_device(SEED, "show", &["Api"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success()
+        .stdout(contains("alice"));
+}
+
+#[test]
+fn db_edit_removes_the_device_without_the_flag() {
+    let fixture = Fixture::new("unset");
+    fixture.create();
+    fixture
+        .with_device(SEED, "db-edit", &["--password", PASSWORD, "--unset-fido2"])
+        .assert()
+        .success();
+    fixture
+        .without_device("show", &["Api", "--password", PASSWORD])
+        .assert()
+        .success()
+        .stdout(contains("alice"));
 }
 
 #[test]
@@ -209,8 +381,7 @@ fn db_edit_removes_and_adds_the_device() {
         .without_device("ls", &["--password", PASSWORD])
         .assert()
         .success()
-        .stdout(contains("Api"))
-        .stderr(contains("pass --fido2").not());
+        .stdout(contains("Api"));
 
     fixture
         .with_device(

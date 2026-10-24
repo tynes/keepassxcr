@@ -65,3 +65,41 @@ fn missing_group_errors_and_open_keeps_going() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn database_names_without_an_extension_use_kdbx() {
+    let dir = std::env::temp_dir().join(format!("kxe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let run = || {
+        let mut cmd = cargo_bin_cmd!("keepassxcr");
+        cmd.env("XDG_RUNTIME_DIR", &dir).env("RUST_BACKTRACE", "0");
+        cmd
+    };
+
+    run()
+        .args(["db-create", "--kdf", "aes-kdf", "--password", PASSWORD])
+        .arg(dir.join("vault"))
+        .assert()
+        .success()
+        .stdout(contains("vault.kdbx"));
+    assert!(dir.join("vault.kdbx").is_file());
+    assert!(!dir.join("vault").exists());
+
+    // Reads and writes by the same short name reach the same file.
+    run()
+        .arg("mkdir")
+        .arg(dir.join("vault"))
+        .args(["Email", "--password", PASSWORD])
+        .assert()
+        .success();
+    run()
+        .arg("ls")
+        .arg(dir.join("vault.kdbx"))
+        .args(["--password", PASSWORD])
+        .assert()
+        .success()
+        .stdout(contains("[G] Email"));
+
+    let _ = fs::remove_dir_all(&dir);
+}

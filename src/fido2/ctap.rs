@@ -187,11 +187,14 @@ pub(super) fn parse_credential(auth_data: &[u8]) -> Result<Vec<u8>, Failure> {
 ///
 /// No `uv` option is sent: the answer depends on whether the device verified
 /// the user, and leaving it out keeps the answer the same on every unlock.
+/// With `user_presence` false the request carries `"up": false`, asking the
+/// device not to wait for a confirmation. Presence does not change the answer.
 pub(super) fn hmac_secret(
     device: &mut Device,
     rp_id: &str,
     credential_id: &[u8],
     salt: &[u8; SALT_LEN],
+    user_presence: bool,
     cancel: &AtomicBool,
     on_touch: &(dyn Fn() + Sync),
 ) -> Result<Secret, Failure> {
@@ -211,31 +214,32 @@ pub(super) fn hmac_secret(
 
     let mut client_data_hash = [0u8; 32];
     OsRng.fill_bytes(&mut client_data_hash);
-    let request = encode(
-        GET_ASSERTION,
-        vec![
-            (int(1), text(rp_id)),
-            (int(2), Value::Bytes(client_data_hash.to_vec())),
-            (
-                int(3),
-                Value::Array(vec![Value::Map(vec![
-                    (text("id"), Value::Bytes(credential_id.to_vec())),
-                    (text("type"), text("public-key")),
-                ])]),
-            ),
-            (
-                int(4),
-                Value::Map(vec![(
-                    text(HMAC_SECRET),
-                    Value::Map(vec![
-                        (int(1), cose_key(&PublicKey::from(&ours))),
-                        (int(2), Value::Bytes(salt_enc.to_vec())),
-                        (int(3), Value::Bytes(salt_auth.to_vec())),
-                    ]),
-                )]),
-            ),
-        ],
-    )?;
+    let mut fields = vec![
+        (int(1), text(rp_id)),
+        (int(2), Value::Bytes(client_data_hash.to_vec())),
+        (
+            int(3),
+            Value::Array(vec![Value::Map(vec![
+                (text("id"), Value::Bytes(credential_id.to_vec())),
+                (text("type"), text("public-key")),
+            ])]),
+        ),
+        (
+            int(4),
+            Value::Map(vec![(
+                text(HMAC_SECRET),
+                Value::Map(vec![
+                    (int(1), cose_key(&PublicKey::from(&ours))),
+                    (int(2), Value::Bytes(salt_enc.to_vec())),
+                    (int(3), Value::Bytes(salt_auth.to_vec())),
+                ]),
+            )]),
+        ),
+    ];
+    if !user_presence {
+        fields.push((int(5), Value::Map(vec![(text("up"), Value::Bool(false))])));
+    }
+    let request = encode(GET_ASSERTION, fields)?;
     let response = decode_map(&device.cbor(&request, USER_TIMEOUT, cancel, on_touch)?)?;
     let auth_data = get_bytes(&response, 2)?;
 

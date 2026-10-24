@@ -19,7 +19,14 @@ const KEY_VERSION: &str = "KPXCR_FIDO2_VERSION";
 const KEY_RP_ID: &str = "KPXCR_FIDO2_RP_ID";
 const KEY_CREDENTIAL_ID: &str = "KPXCR_FIDO2_CREDENTIAL_ID";
 const KEY_SALT: &str = "KPXCR_FIDO2_SALT";
-const KEYS: [&str; 4] = [KEY_VERSION, KEY_RP_ID, KEY_CREDENTIAL_ID, KEY_SALT];
+const KEY_PASSWORD: &str = "KPXCR_FIDO2_PASSWORD";
+const KEYS: [&str; 5] = [
+    KEY_VERSION,
+    KEY_RP_ID,
+    KEY_CREDENTIAL_ID,
+    KEY_SALT,
+    KEY_PASSWORD,
+];
 /// Layout version of the keys above.
 const VERSION: u32 = 1;
 
@@ -32,6 +39,9 @@ pub struct Fido2Config {
     pub credential_id: Vec<u8>,
     /// Salt the device derives the secret from.
     pub salt: [u8; SALT_LEN],
+    /// Whether a password is also part of the key, so unlocking asks for one.
+    /// Settings saved before this was recorded read as `true`.
+    pub password: bool,
 }
 
 impl std::fmt::Debug for Fido2Config {
@@ -39,6 +49,7 @@ impl std::fmt::Debug for Fido2Config {
         f.debug_struct("Fido2Config")
             .field("rp_id", &self.rp_id)
             .field("credential", &self.fingerprint())
+            .field("password", &self.password)
             .finish_non_exhaustive()
     }
 }
@@ -75,10 +86,16 @@ impl Fido2Config {
             }
             _ => return Err(incomplete()),
         };
+        let password = match map.get(KEY_PASSWORD) {
+            Some(VariantValue::Bool(password)) => *password,
+            None => true,
+            Some(_) => return Err(incomplete()),
+        };
         Ok(Some(Self {
             rp_id,
             credential_id,
             salt,
+            password,
         }))
     }
 
@@ -103,6 +120,7 @@ impl Fido2Config {
             KEY_SALT.to_string(),
             VariantValue::ByteArray(self.salt.to_vec()),
         );
+        map.insert(KEY_PASSWORD.to_string(), VariantValue::Bool(self.password));
         write_map(&map)
     }
 
@@ -151,6 +169,7 @@ mod tests {
             rp_id: "keepassxcr".to_string(),
             credential_id: vec![1, 2, 3, 4],
             salt: [9; SALT_LEN],
+            password: false,
         }
     }
 
@@ -188,6 +207,15 @@ mod tests {
             Fido2Config::from_public_custom_data(None).expect("none"),
             None
         );
+    }
+
+    #[test]
+    fn settings_without_the_password_flag_ask_for_a_password() {
+        let mut map = read_map(Some(&config().store(None).expect("store"))).expect("map");
+        map.remove(KEY_PASSWORD);
+        let older = write_map(&map).expect("write");
+        let read = Fido2Config::from_public_custom_data(Some(&older)).expect("read");
+        assert_eq!(read.map(|config| config.password), Some(true));
     }
 
     #[test]
