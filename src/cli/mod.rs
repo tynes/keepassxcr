@@ -103,6 +103,9 @@ pub enum Command {
     /// Use a YubiKey plugged into another machine.
     #[command(subcommand)]
     Yubikey(YubiKeyCommand),
+    /// Use a FIDO2 device plugged into another machine.
+    #[command(subcommand)]
+    Fido2(Fido2Command),
     /// Run the unlock agent (started by `unlock`).
     #[command(name = "__agent", hide = true)]
     Agent(AgentArgs),
@@ -125,6 +128,10 @@ pub struct CredentialArgs {
     /// YubiKey challenge-response slot and optional serial (e.g. 2 or 2:7370001).
     #[arg(short = 'y', long, value_name = "SLOT[:SERIAL]")]
     pub yubikey: Option<YubiKeySlot>,
+    /// Use a FIDO2 device (e.g. a Ledger running the Security Key app). It
+    /// takes the place of a key file.
+    #[arg(long, conflicts_with = "key_file")]
+    pub fido2: bool,
     /// Ignore the unlock agent and ask for credentials.
     #[arg(long)]
     pub no_agent: bool,
@@ -178,6 +185,25 @@ pub enum YubiKeyCommand {
 #[derive(Debug, Args)]
 pub struct YubiKeyServeArgs {
     /// Socket to listen on [default: $KEEPASSXCR_YUBIKEY_SOCKET, else ~/.keepassxcr-yubikey.sock].
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+/// FIDO2 subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Fido2Command {
+    /// Answer FIDO2 requests from a socket, e.g. forwarded with `ssh -R`.
+    ///
+    /// Run this where the FIDO2 device is plugged in. On the other machine
+    /// keepassxcr uses $KEEPASSXCR_FIDO2_SOCKET, or ~/.keepassxcr-fido2.sock
+    /// when it exists, instead of USB.
+    Serve(Fido2ServeArgs),
+}
+
+/// `fido2 serve` arguments.
+#[derive(Debug, Args)]
+pub struct Fido2ServeArgs {
+    /// Socket to listen on [default: $KEEPASSXCR_FIDO2_SOCKET, else ~/.keepassxcr-fido2.sock].
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
@@ -250,6 +276,12 @@ pub struct DbEditArgs {
     /// Stop requiring a YubiKey.
     #[arg(long)]
     pub unset_yubikey: bool,
+    /// Set up a new FIDO2 device, in place of the key file.
+    #[arg(long, conflicts_with_all = ["new_key_file", "unset_fido2"])]
+    pub new_fido2: bool,
+    /// Stop requiring a FIDO2 device.
+    #[arg(long)]
+    pub unset_fido2: bool,
 }
 
 /// Merge two databases.
@@ -274,6 +306,9 @@ pub struct MergeArgs {
     /// YubiKey slot and optional serial for the source database.
     #[arg(long = "yubikey-from", value_name = "SLOT[:SERIAL]")]
     pub source_yubikey: Option<YubiKeySlot>,
+    /// Use a FIDO2 device for the source database.
+    #[arg(long = "fido2-from", conflicts_with = "source_key_file")]
+    pub source_fido2: bool,
 }
 
 /// Export database arguments.

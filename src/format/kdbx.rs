@@ -349,7 +349,34 @@ fn write_atomic(path: &Path, data: &[u8]) -> AppResult<()> {
     result
 }
 
-fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile> {
+/// The unencrypted header fields that matter before decrypting: the version
+/// and the KDBX 4 `PublicCustomData`, where a FIDO2 device's settings live.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PublicHeader {
+    /// KDBX version.
+    pub version: KdbxVersion,
+    /// KDBX4 `PublicCustomData` header field, as in [`KdbxFile::public_custom_data`].
+    pub public_custom_data: Option<Vec<u8>>,
+}
+
+/// Read the unencrypted header of the database at `path`, without credentials.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read or its header is malformed or corrupted.
+pub fn read_public_header(path: &Path) -> AppResult<PublicHeader> {
+    let data = fs::read(path)?;
+    let (version, header, _, _) = read_outer_header(&data)?;
+    Ok(PublicHeader {
+        version,
+        public_custom_data: header.public_custom_data,
+    })
+}
+
+/// Parse the outer header, checking the KDBX 4 header hash. Returns the
+/// version, the parsed header, the header's bytes and the bytes after it.
+fn read_outer_header(data: &[u8]) -> AppResult<(KdbxVersion, HeaderData, &[u8], &[u8])> {
     let mut cursor = Cursor::new(data);
 
     let sig1 = read_u32_le(&mut cursor)?;
@@ -380,6 +407,11 @@ fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile
             return Err(AppError::Format("header hash mismatch".to_string()));
         }
     }
+    Ok((version, header, header_data, body))
+}
+
+fn read_kdbx_bytes(data: &[u8], credentials: &Credentials) -> AppResult<KdbxFile> {
+    let (version, header, header_data, body) = read_outer_header(data)?;
 
     if credentials.is_empty() {
         return Err(AppError::InvalidInput(

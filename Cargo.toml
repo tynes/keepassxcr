@@ -59,8 +59,12 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
-# YubiKey OTP interface: IOKit on macOS (opened shared), pure-Rust hidraw on Linux.
+# YubiKey OTP and FIDO2 interfaces: IOKit on macOS (opened shared), pure-Rust hidraw on Linux.
 hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev", "macos-shared-device"] }
+# FIDO2 hmac-secret (Ledger Security Key app and other security keys): CTAP2
+# commands are CBOR, and the hmac-secret salt is sent under a P-256 ECDH key.
+ciborium = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdh"] }
 # Reading OpenSSH private keys for `ssh-add`.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ecdsa", "encryption"], optional = true }
 ssh-encoding = { version = "0.2", optional = true }
@@ -73,6 +77,9 @@ cli = ["dep:anyhow", "dep:clap", "dep:rpassword", "dep:indicatif", "dep:arboard"
 # Testing only: KEEPASSXCR_SOFTWARE_YUBIKEY=<hex secret>[:fixed][:touch] replaces the
 # USB YubiKey with an emulated one. Never enable this for a build you use.
 software-yubikey = []
+# Testing only: KEEPASSXCR_SOFTWARE_FIDO2=<hex secret> replaces USB FIDO2 devices with
+# an emulated authenticator. Never enable this for a build you use.
+software-fido2 = []
 
 [dev-dependencies]
 assert_cmd = "2.0"

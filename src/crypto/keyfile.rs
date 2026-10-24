@@ -30,6 +30,16 @@ impl KeyFile {
         Ok(Self { raw_key })
     }
 
+    /// A key file holding `raw_key` as is, like a 32-byte binary key file.
+    ///
+    /// Used for secrets that come from a device instead of a file, such as a
+    /// FIDO2 device's hmac-secret.
+    pub fn from_raw(raw_key: &[u8; 32]) -> Self {
+        Self {
+            raw_key: Zeroizing::new(raw_key.to_vec()),
+        }
+    }
+
     /// Raw key bytes.
     pub fn raw_key(&self) -> &[u8] {
         &self.raw_key

@@ -23,7 +23,10 @@ use crate::cli::{
 };
 use crate::crypto::{CipherId, KdfConfig, KdfType, KeyFile, ProtectedStreamAlgo};
 use crate::error::{AppError, AppResult};
-use crate::format::{Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, write_kdbx};
+use crate::fido2::{self, Fido2Config};
+use crate::format::{
+    Compression, Credentials, KdbxFile, KdbxVersion, read_kdbx, read_public_header, write_kdbx,
+};
 use crate::model::{Attachment, Database, Entry, Group, Removal, placeholders};
 use crate::xml::{BinaryPool, write_database};
 
@@ -71,21 +74,27 @@ pub fn dispatch(cli: crate::cli::Cli) -> anyhow::Result<()> {
         Command::Lock(args) => lock(args).context("lock failed"),
         Command::Status(args) => status(args).context("status failed"),
         Command::Yubikey(command) => yubikey(command).context("yubikey failed"),
+        Command::Fido2(command) => fido2_command(command).context("fido2 failed"),
         Command::Agent(args) => serve_agent(args).context("agent failed"),
     }
 }
 
 fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
-    let credentials = build_new_database_credentials(&args.credentials)?;
+    let version = parse_version(args.format)?;
+    let cipher = parse_cipher(&args.cipher)?;
+    let kdf = parse_kdf(&args.kdf, version)?;
+    if args.credentials.fido2 && !version.is_kdbx4() {
+        return Err(anyhow::anyhow!(AppError::InvalidInput(
+            "--fido2 needs a KDBX 4 database (--format 4)".to_string(),
+        )));
+    }
+
+    let (credentials, public_custom_data) = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "db-create requires at least one credential".to_string(),
         )));
     }
-
-    let version = parse_version(args.format)?;
-    let cipher = parse_cipher(&args.cipher)?;
-    let kdf = parse_kdf(&args.kdf, version)?;
 
     let name = database_name_from_path(&args.database);
     let mut database = Database::new(name.clone());
@@ -99,7 +108,7 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 
     let file = KdbxFile {
         version,
-        public_custom_data: None,
+        public_custom_data,
         cipher,
         compression: Compression::Gzip,
         kdf,
@@ -115,9 +124,9 @@ fn db_create(args: DbCreateArgs) -> anyhow::Result<()> {
 fn db_edit(args: DbEditArgs) -> anyhow::Result<()> {
     // The new credentials start from the current ones, so they must be known here.
     let credentials = build_local_credentials(&args.database, &args.credentials)?;
-    let file = read_kdbx(&args.database, &credentials)?;
+    let mut file = read_kdbx(&args.database, &credentials)?;
 
-    let new_credentials = build_new_credentials(&args, &credentials)?;
+    let new_credentials = build_new_credentials(&args, &credentials, &mut file)?;
     if new_credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "db-edit requires new credentials".to_string(),
@@ -144,6 +153,10 @@ fn db_info(args: DbOpenArgs) -> anyhow::Result<()> {
     println!("Cipher: {:?}", file.cipher);
     println!("KDF: {:?}", file.kdf);
     println!("Compression: {:?}", file.compression);
+    if let Some(config) = Fido2Config::from_public_custom_data(file.public_custom_data.as_deref())?
+    {
+        println!("FIDO2: credential {}", config.fingerprint());
+    }
     println!("Groups: {groups}");
     println!("Entries: {entries}");
     Ok(())
@@ -158,7 +171,7 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
             warn_password_argument();
             Some(SecretString::new(password))
         }
-        None if args.source_key_file.is_none() => {
+        None if args.source_key_file.is_none() && !args.source_fido2 => {
             let password = read_secret("Password for source database: ")?;
             (!password.is_empty()).then(|| into_secret(password))
         }
@@ -166,11 +179,14 @@ fn merge(args: MergeArgs) -> anyhow::Result<()> {
     };
     let source_credentials = Credentials {
         password: source_password,
-        key_file: args
-            .source_key_file
-            .as_ref()
-            .map(|path| KeyFile::load(path))
-            .transpose()?,
+        key_file: if args.source_fido2 {
+            Some(fido2_key_file(&args.source)?)
+        } else {
+            args.source_key_file
+                .as_ref()
+                .map(|path| KeyFile::load(path))
+                .transpose()?
+        },
         yubikey: args.source_yubikey,
         agent: None,
     };
@@ -221,7 +237,7 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
         None,
     )?;
 
-    let credentials = build_new_database_credentials(&args.credentials)?;
+    let (credentials, public_custom_data) = build_new_database_credentials(&args.credentials)?;
     if credentials.is_empty() {
         return Err(anyhow::anyhow!(AppError::InvalidInput(
             "import requires credentials for new database".to_string(),
@@ -230,7 +246,7 @@ fn import_db(args: DbImportArgs) -> anyhow::Result<()> {
 
     let file = KdbxFile {
         version: KdbxVersion::V4_0,
-        public_custom_data: None,
+        public_custom_data,
         cipher: CipherId::Aes256,
         compression: Compression::Gzip,
         kdf: KdfConfig::default_argon2id(),
@@ -798,25 +814,50 @@ fn describe_unlocked(status: &agent::AgentStatus) -> String {
 
 fn yubikey(command: YubiKeyCommand) -> anyhow::Result<()> {
     match command {
-        YubiKeyCommand::Serve(args) => {
-            #[cfg(unix)]
-            {
-                let socket = match args.socket {
-                    Some(socket) => socket,
-                    None => crate::yubikey::forward::socket_path()?,
-                };
-                crate::yubikey::forward::serve(&socket)?;
-                Ok(())
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = args;
-                Err(anyhow::anyhow!(AppError::InvalidInput(
-                    "yubikey serve is only supported on Unix".to_string()
-                )))
-            }
-        }
+        #[cfg(unix)]
+        YubiKeyCommand::Serve(args) => serve_forwarded(
+            args.socket,
+            crate::yubikey::forward::socket_path,
+            crate::yubikey::forward::serve,
+        ),
+        #[cfg(not(unix))]
+        YubiKeyCommand::Serve(_) => Err(not_unix("yubikey serve")),
     }
+}
+
+fn fido2_command(command: crate::cli::Fido2Command) -> anyhow::Result<()> {
+    match command {
+        #[cfg(unix)]
+        crate::cli::Fido2Command::Serve(args) => serve_forwarded(
+            args.socket,
+            crate::fido2::forward::socket_path,
+            crate::fido2::forward::serve,
+        ),
+        #[cfg(not(unix))]
+        crate::cli::Fido2Command::Serve(_) => Err(not_unix("fido2 serve")),
+    }
+}
+
+/// Run a device server on `socket`, or on its default socket.
+#[cfg(unix)]
+fn serve_forwarded(
+    socket: Option<PathBuf>,
+    default_socket: fn() -> AppResult<PathBuf>,
+    serve: fn(&Path) -> AppResult<()>,
+) -> anyhow::Result<()> {
+    let socket = match socket {
+        Some(socket) => socket,
+        None => default_socket()?,
+    };
+    serve(&socket)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn not_unix(command: &str) -> anyhow::Error {
+    anyhow::anyhow!(AppError::InvalidInput(format!(
+        "{command} is only supported on Unix"
+    )))
 }
 
 fn serve_agent(args: crate::cli::AgentArgs) -> anyhow::Result<()> {
@@ -834,8 +875,11 @@ pub(crate) fn build_credentials(
     database: &Path,
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<Credentials> {
-    let explicit =
-        args.password.is_some() || args.no_password || args.yubikey.is_some() || args.no_agent;
+    let explicit = args.password.is_some()
+        || args.no_password
+        || args.yubikey.is_some()
+        || args.fido2
+        || args.no_agent;
     if !explicit && let Some(key) = agent::credentials_for(database)? {
         args.validate()?;
         return Ok(Credentials {
@@ -848,12 +892,21 @@ pub(crate) fn build_credentials(
     build_local_credentials(database, args)
 }
 
-/// Build credentials from CLI arguments only, ignoring any agent.
+/// Build credentials for `database` from CLI arguments only, ignoring any agent.
 fn build_local_credentials(
     database: &Path,
     args: &crate::cli::CredentialArgs,
 ) -> AppResult<Credentials> {
-    build_credentials_with(args, &unlock_prompt(database), false)
+    let mut credentials = build_credentials_with(args, &unlock_prompt(database), false)?;
+    if args.fido2 {
+        credentials.key_file = Some(fido2_key_file(database)?);
+    } else if args.key_file.is_none() && matches!(fido2_config(database), Ok(Some(_))) {
+        warn!(
+            "{} is set up for a FIDO2 device; pass --fido2 to use it",
+            database.display()
+        );
+    }
+    Ok(credentials)
 }
 
 /// The unlock prompt, worded like keepassxc-cli's so it reads as a question
@@ -866,9 +919,38 @@ fn unlock_prompt(database: &Path) -> String {
     format!("Enter password to unlock {name}: ")
 }
 
-/// Build credentials for a new database, asking twice for a prompted password.
-fn build_new_database_credentials(args: &crate::cli::CredentialArgs) -> AppResult<Credentials> {
-    build_credentials_with(args, "Password: ", true)
+/// Build credentials for a new database, asking twice for a prompted
+/// password. With `--fido2`, set up a FIDO2 device and also return the
+/// `PublicCustomData` header holding its settings.
+fn build_new_database_credentials(
+    args: &crate::cli::CredentialArgs,
+) -> AppResult<(Credentials, Option<Vec<u8>>)> {
+    let mut credentials = build_credentials_with(args, "Password: ", true)?;
+    let public_custom_data = if args.fido2 {
+        let (config, secret) = fido2::enroll()?;
+        credentials.key_file = Some(KeyFile::from_raw(&secret));
+        Some(config.store(None)?)
+    } else {
+        None
+    };
+    Ok((credentials, public_custom_data))
+}
+
+/// The FIDO2 settings in `database`'s header, if any.
+fn fido2_config(database: &Path) -> AppResult<Option<Fido2Config>> {
+    let header = read_public_header(database)?;
+    Fido2Config::from_public_custom_data(header.public_custom_data.as_deref())
+}
+
+/// Ask `database`'s FIDO2 device for its secret, as a key file.
+fn fido2_key_file(database: &Path) -> AppResult<KeyFile> {
+    let config = fido2_config(database)?.ok_or_else(|| {
+        AppError::InvalidInput(format!(
+            "{} is not set up for a FIDO2 device; set one up with 'keepassxcr db-edit --new-fido2'",
+            database.display()
+        ))
+    })?;
+    Ok(KeyFile::from_raw(&*fido2::secret(&config)?))
 }
 
 fn build_credentials_with(
@@ -939,7 +1021,13 @@ fn warn_password_argument() {
     }
 }
 
-fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<Credentials> {
+/// The credentials `db-edit` saves with. Setting up or removing a FIDO2
+/// device also updates its settings in `file`'s header.
+fn build_new_credentials(
+    args: &DbEditArgs,
+    current: &Credentials,
+    file: &mut KdbxFile,
+) -> AppResult<Credentials> {
     let password = if let Some(pass) = &args.new_password {
         warn_password_argument();
         Some(SecretString::new(pass.clone()))
@@ -949,8 +1037,23 @@ fn build_new_credentials(args: &DbEditArgs, current: &Credentials) -> AppResult<
         current.password.clone()
     };
 
+    // The FIDO2 secret takes the key-file slot, so a new key file replaces it too.
+    if args.new_key_file.is_some() || args.unset_fido2 {
+        file.public_custom_data = Fido2Config::remove(file.public_custom_data.as_deref())?;
+    }
     let key_file = if let Some(path) = &args.new_key_file {
         Some(KeyFile::load(path)?)
+    } else if args.new_fido2 {
+        if !file.version.is_kdbx4() {
+            return Err(AppError::InvalidInput(
+                "--new-fido2 needs a KDBX 4 database".to_string(),
+            ));
+        }
+        let (config, secret) = fido2::enroll()?;
+        file.public_custom_data = Some(config.store(file.public_custom_data.as_deref())?);
+        Some(KeyFile::from_raw(&secret))
+    } else if args.unset_fido2 && args.credentials.fido2 {
+        None
     } else {
         current.key_file.clone()
     };
